@@ -17,8 +17,13 @@ import json
 import argparse
 import io
 import math
+import time
 
+# Disable NNPACK — causes crashes on unsupported hardware (Docker/VM CPUs)
+os.environ["NNPACK_DISABLE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "2"  # Limit OpenMP threads to avoid memory spikes
+os.environ["MKL_NUM_THREADS"] = "2"
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -38,6 +43,16 @@ def load_easyocr(langs=None):
         return _easyocr_reader
 
     import easyocr
+
+    # Disable NNPACK in PyTorch to prevent crashes on unsupported CPUs
+    try:
+        import torch
+        if hasattr(torch.backends, "nnpack"):
+            torch.backends.nnpack.enabled = False
+            print("[PythonOCR] NNPACK disabled", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
     if langs is None:
         langs = ["tr", "en"]
 
@@ -412,7 +427,22 @@ def recognize_easyocr(image_bytes):
     import numpy as np
     from PIL import Image
 
+    # Validate image size (reject files > 20MB to prevent OOM)
+    if len(image_bytes) > 20 * 1024 * 1024:
+        return {
+            "success": False,
+            "error": f"Image too large ({len(image_bytes) // 1024 // 1024}MB). Max 20MB.",
+        }
+
     image = Image.open(io.BytesIO(image_bytes))
+
+    # Limit image dimensions to prevent memory issues on CPU
+    max_pixels = 4096
+    if max(image.size) > max_pixels:
+        ratio = max_pixels / max(image.size)
+        new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+        print(f"[PythonOCR] Resizing image from {image.size} to {new_size}", file=sys.stderr, flush=True)
+        image = image.resize(new_size, resample=3)
 
     # Step 1: Detect and crop document region
     doc_image, detected = detect_document_region(image)
@@ -571,13 +601,52 @@ def recognize_trocr(image_bytes):
 
 
 def recognize_image(image_bytes, engine="easyocr"):
+    """Run OCR with full crash protection."""
+    import traceback
     try:
+        print(f"[PythonOCR] recognize_image called: engine={engine}, size={len(image_bytes)} bytes",
+              file=sys.stderr, flush=True)
+        t0 = time.time()
         if engine == "trocr":
-            return recognize_trocr(image_bytes)
+            result = recognize_trocr(image_bytes)
         else:
-            return recognize_easyocr(image_bytes)
+            result = recognize_easyocr(image_bytes)
+        elapsed = time.time() - t0
+        print(f"[PythonOCR] OCR completed in {elapsed:.1f}s, success={result.get('success')}",
+              file=sys.stderr, flush=True)
+        return result
     except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[PythonOCR] ERROR in recognize_image: {e}\n{tb}", file=sys.stderr, flush=True)
         return {"success": False, "error": str(e)}
+
+
+def warmup_ocr():
+    """Run a tiny dummy image through the full pipeline to pre-initialize all C extensions.
+    This catches NNPACK/segfault issues at startup instead of on first real request."""
+    import numpy as np
+    from PIL import Image
+
+    print("[PythonOCR] Running warm-up inference...", file=sys.stderr, flush=True)
+    try:
+        # Create a small white image with some dark pixels (simulates text)
+        img = Image.new("RGB", (200, 50), color=(255, 255, 255))
+        pixels = img.load()
+        # Draw a simple line of dark pixels
+        for x in range(20, 180):
+            for y in range(20, 30):
+                pixels[x, y] = (0, 0, 0)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        reader = load_easyocr()
+        img_array = np.array(img)
+        _ = reader.readtext(img_array, detail=0)
+        print("[PythonOCR] Warm-up inference completed successfully!", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[PythonOCR] Warm-up inference failed (non-fatal): {e}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -591,9 +660,13 @@ def run_server(port=5555):
     import traceback
     import threading
 
-    print("Loading EasyOCR model (tr+en)...", file=sys.stderr, flush=True)
+    print("[PythonOCR] Loading EasyOCR model (tr+en)...", file=sys.stderr, flush=True)
     load_easyocr()
-    print("EasyOCR model loaded!", file=sys.stderr, flush=True)
+    print("[PythonOCR] EasyOCR model loaded!", file=sys.stderr, flush=True)
+
+    # Pre-warm: run a dummy inference to fully initialize PyTorch/NNPACK/OpenCV
+    # This catches segfaults at startup instead of on the first real request
+    warmup_ocr()
 
     class OCRHandler(BaseHTTPRequestHandler):
         # Increase socket timeout for large requests
