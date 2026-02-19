@@ -39,14 +39,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
+# Install torch + torchvision together from CPU index to ensure version compatibility
 RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu
+    torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Install easyocr without its torch/torchvision deps (already installed above)
+RUN pip install --no-cache-dir --no-deps easyocr
+# Install remaining dependencies
 RUN pip install --no-cache-dir \
     transformers \
-    easyocr \
     Pillow \
     opencv-python-headless \
-    numpy
+    numpy \
+    scikit-image \
+    scipy \
+    pyclipper \
+    shapely \
+    python-bidi \
+    PyYAML \
+    ninja
 
 WORKDIR /app
 
