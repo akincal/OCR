@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir \
     transformers==4.30.2 \
     Pillow \
     opencv-python-headless \
-    numpy \
+    "numpy<2" \
     scikit-image \
     scipy \
     pyclipper \
