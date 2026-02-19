@@ -586,21 +586,34 @@ def recognize_image(image_bytes, engine="easyocr"):
 
 def run_server(port=5555):
     from http.server import HTTPServer, BaseHTTPRequestHandler
+    from socketserver import ThreadingMixIn
     import urllib.parse
+    import traceback
+    import threading
 
-    print("Loading EasyOCR model (tr+en)...", file=sys.stderr)
+    print("Loading EasyOCR model (tr+en)...", file=sys.stderr, flush=True)
     load_easyocr()
-    print("EasyOCR model loaded!", file=sys.stderr)
+    print("EasyOCR model loaded!", file=sys.stderr, flush=True)
 
     class OCRHandler(BaseHTTPRequestHandler):
+        # Increase socket timeout for large requests
+        timeout = 300  # 5 minutes
+
         def log_message(self, fmt, *args):
-            pass
+            print(f"[PythonOCR] {fmt % args}", file=sys.stderr, flush=True)
 
         def do_POST(self):
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-
             try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                self.log_message("POST %s  Content-Length=%d", self.path, content_length)
+
+                if content_length == 0:
+                    self._send_json({"success": False, "error": "Empty request body"})
+                    return
+
+                body = self.rfile.read(content_length)
+                self.log_message("Body read OK (%d bytes), starting OCR...", len(body))
+
                 parsed = urllib.parse.urlparse(self.path)
                 params = urllib.parse.parse_qs(parsed.query)
                 engine = params.get("engine", ["easyocr"])[0]
@@ -611,28 +624,40 @@ def run_server(port=5555):
                     result = {"status": "healthy", "engine": "easyocr+trocr"}
                 else:
                     result = {"success": False, "error": "Unknown endpoint"}
-            except Exception as e:
-                result = {"success": False, "error": str(e)}
 
-            response = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                self.log_message("OCR done. success=%s", result.get("success", "?"))
+                self._send_json(result)
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                self.log_message("ERROR in do_POST: %s\n%s", str(e), tb)
+                try:
+                    self._send_json({"success": False, "error": str(e)})
+                except Exception:
+                    pass
+
+        def _send_json(self, data):
+            response = json.dumps(data, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", len(response))
+            self.send_header("Content-Length", str(len(response)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(response)
+            self.wfile.flush()
 
         def do_GET(self):
             if self.path == "/health":
-                result = {"status": "healthy", "engine": "easyocr+trocr"}
-                response = json.dumps(result).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", len(response))
-                self.end_headers()
-                self.wfile.write(response)
+                self._send_json({"status": "healthy", "engine": "easyocr+trocr"})
+            else:
+                self._send_json({"error": "Not found"})
 
-    server = HTTPServer(("0.0.0.0", port), OCRHandler)
-    print(f"OCR inference server running on http://0.0.0.0:{port}", file=sys.stderr)
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    server = ThreadedHTTPServer(("0.0.0.0", port), OCRHandler)
+    print(f"OCR inference server running on http://0.0.0.0:{port} (threaded)", file=sys.stderr, flush=True)
     server.serve_forever()
 
 

@@ -189,7 +189,23 @@ func (e *TrOCREngine) RecognizeFromBytes(imageBytes []byte) (*OCRResult, error) 
 
 // recognizeViaServer sends image to Python HTTP server
 func (e *TrOCREngine) recognizeViaServer(imageBytes []byte) (*OCRResult, error) {
-	resp, err := http.Post(e.serverURL+"/ocr", "application/octet-stream", bytes.NewReader(imageBytes))
+	// Use a dedicated client with a long timeout — OCR on CPU can take minutes
+	client := &http.Client{
+		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{
+			DisableKeepAlives: true, // Use fresh connection each time
+		},
+	}
+
+	req, err := http.NewRequest("POST", e.serverURL+"/ocr", bytes.NewReader(imageBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Connection", "close")
+
+	log.Printf("[OCR] Sending %d bytes to Python server...", len(imageBytes))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call OCR server: %w", err)
 	}
@@ -200,9 +216,11 @@ func (e *TrOCREngine) recognizeViaServer(imageBytes []byte) (*OCRResult, error) 
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	log.Printf("[OCR] Got response (%d bytes, status %d)", len(body), resp.StatusCode)
+
 	var result OCRResult
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("failed to parse response (body=%q): %w", string(body[:min(len(body), 200)]), err)
 	}
 
 	return &result, nil
