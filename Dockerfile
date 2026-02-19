@@ -24,6 +24,15 @@ COPY . .
 # Build the application
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/ocr-server ./cmd/server
 
+# Build NNPACK stub — provides a no-op nnp_initialize that returns "unsupported hardware"
+# This prevents SIGILL crashes on CPUs that don't support NNPACK's SIMD instructions
+RUN printf '#include <stddef.h>\n\
+enum nnp_status { nnp_status_success = 0, nnp_status_unsupported_hardware = 12 };\n\
+enum nnp_status nnp_initialize(void) { return nnp_status_unsupported_hardware; }\n\
+int nnp_deinitialize(void) { return 0; }\n\
+' > /tmp/stub_nnpack.c && \
+    gcc -shared -fPIC -o /tmp/libstub_nnpack.so /tmp/stub_nnpack.c
+
 # Stage 2: Runtime stage with Python
 FROM python:3.11-slim-bookworm
 
@@ -63,6 +72,9 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/ocr-server .
 
+# Copy NNPACK stub library from builder
+COPY --from=builder /tmp/libstub_nnpack.so /usr/local/lib/libstub_nnpack.so
+
 # Copy scripts directory (needed by Python OCR inference)
 COPY scripts/ ./scripts/
 
@@ -73,7 +85,11 @@ RUN mkdir -p /app/models /app/uploads
 ENV PORT=8080 \
     MODEL_PATH=/app/models \
     GIN_MODE=release \
-    PYTHON_PATH=python3
+    PYTHON_PATH=python3 \
+    LD_PRELOAD=/usr/local/lib/libstub_nnpack.so \
+    NNPACK_DISABLE=1 \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2
 
 # Expose port
 EXPOSE 8080

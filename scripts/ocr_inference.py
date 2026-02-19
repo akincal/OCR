@@ -622,31 +622,32 @@ def recognize_image(image_bytes, engine="easyocr"):
 
 
 def warmup_ocr():
-    """Run a tiny dummy image through the full pipeline to pre-initialize all C extensions.
-    This catches NNPACK/segfault issues at startup instead of on first real request."""
+    """Run a realistic-sized dummy image through the full EasyOCR pipeline.
+    Uses a 640x480 image (similar to real photos) to trigger ALL code paths
+    including CRAFT detector convolutions that use NNPACK on larger images.
+    If NNPACK crashes, it happens here at startup instead of on first request."""
     import numpy as np
-    from PIL import Image
+    from PIL import Image, ImageDraw
 
-    print("[PythonOCR] Running warm-up inference...", file=sys.stderr, flush=True)
+    print("[PythonOCR] Running warm-up inference (640x480)...", file=sys.stderr, flush=True)
     try:
-        # Create a small white image with some dark pixels (simulates text)
-        img = Image.new("RGB", (200, 50), color=(255, 255, 255))
-        pixels = img.load()
-        # Draw a simple line of dark pixels
-        for x in range(20, 180):
-            for y in range(20, 30):
-                pixels[x, y] = (0, 0, 0)
+        # Create a realistically-sized image with text-like patterns
+        img = Image.new("RGB", (640, 480), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        # Draw several lines of dark rectangles (simulates text lines)
+        for row in range(5):
+            y = 50 + row * 60
+            for col in range(8):
+                x = 30 + col * 70
+                draw.rectangle([x, y, x + 50, y + 20], fill=(0, 0, 0))
 
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        img_bytes = buf.getvalue()
-
-        reader = load_easyocr()
         img_array = np.array(img)
+        reader = load_easyocr()
         _ = reader.readtext(img_array, detail=0)
         print("[PythonOCR] Warm-up inference completed successfully!", file=sys.stderr, flush=True)
     except Exception as e:
-        print(f"[PythonOCR] Warm-up inference failed (non-fatal): {e}", file=sys.stderr, flush=True)
+        print(f"[PythonOCR] WARNING: Warm-up inference failed: {e}", file=sys.stderr, flush=True)
+        print("[PythonOCR] OCR requests may crash. Check CPU compatibility.", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
