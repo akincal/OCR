@@ -633,6 +633,9 @@ def recognize_tesseract(image_bytes):
     doc_image = ensure_correct_orientation(doc_image)
 
     # Tesseract OCR with Turkish + English
+    # --oem 3: Use LSTM OCR Engine Mode (most accurate)
+    # --psm 6: Assume a single uniform block of text
+    # -l tur+eng: Enable Turkish and English language support
     custom_config = r'--oem 3 --psm 6 -l tur+eng'
     
     # Get detailed data with bounding boxes and confidence
@@ -646,6 +649,7 @@ def recognize_tesseract(image_bytes):
         text = data['text'][i].strip()
         conf = int(data['conf'][i])
         
+        # Tesseract uses -1 for invalid/no confidence value
         if not text or conf < 0:
             continue
             

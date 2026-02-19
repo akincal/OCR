@@ -48,6 +48,7 @@ RUN pip install --no-cache-dir \
     Pillow==10.2.0 \
     numpy==1.24.3 \
     opencv-python-headless==4.8.1.78
+# Note: NumPy 1.24.3 is the last version without mandatory AVX2 CPU instructions
 
 # Install PyTorch and EasyOCR/TrOCR dependencies (optional engines)
 # torch 1.13.1+cpu is the last version that does NOT require AVX2 CPU instructions.
