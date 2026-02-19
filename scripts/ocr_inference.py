@@ -631,8 +631,8 @@ def run_server(port=5555):
                 self.end_headers()
                 self.wfile.write(response)
 
-    server = HTTPServer(("127.0.0.1", port), OCRHandler)
-    print(f"OCR inference server running on http://127.0.0.1:{port}", file=sys.stderr)
+    server = HTTPServer(("0.0.0.0", port), OCRHandler)
+    print(f"OCR inference server running on http://0.0.0.0:{port}", file=sys.stderr)
     server.serve_forever()
 
 

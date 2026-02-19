@@ -36,9 +36,9 @@ func main() {
 	log.Println("This may take a few minutes on first launch...")
 	if err := ocrEngine.Initialize(); err != nil {
 		log.Printf("WARNING: OCR engine failed to start: %v", err)
-		log.Println("API will start but OCR requests will fail.")
+		log.Println("The engine will auto-restart when the first OCR request arrives.")
 		log.Println("Make sure Python dependencies are installed:")
-		log.Println("  pip3 install torch transformers Pillow")
+		log.Println("  pip3 install torch transformers easyocr Pillow opencv-python-headless numpy")
 	} else {
 		log.Println("TrOCR engine initialized successfully")
 	}
