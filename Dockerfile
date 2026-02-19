@@ -24,17 +24,9 @@ COPY . .
 # Build the application
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/ocr-server ./cmd/server
 
-# Build NNPACK stub — provides a no-op nnp_initialize that returns "unsupported hardware"
-# This prevents SIGILL crashes on CPUs that don't support NNPACK's SIMD instructions
-RUN printf '#include <stddef.h>\n\
-enum nnp_status { nnp_status_success = 0, nnp_status_unsupported_hardware = 12 };\n\
-enum nnp_status nnp_initialize(void) { return nnp_status_unsupported_hardware; }\n\
-int nnp_deinitialize(void) { return 0; }\n\
-' > /tmp/stub_nnpack.c && \
-    gcc -shared -fPIC -o /tmp/libstub_nnpack.so /tmp/stub_nnpack.c
-
 # Stage 2: Runtime stage with Python
-FROM python:3.11-slim-bookworm
+# Use Python 3.10 because torch 1.13.1 (last version without AVX2 requirement) supports 3.7-3.10
+FROM python:3.10-slim-bookworm
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,14 +40,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-# Install torch + torchvision together from CPU index to ensure version compatibility
+# torch 1.13.1+cpu is the last version that does NOT require AVX2 CPU instructions.
+# PyTorch 2.x wheels use AVX2 which causes SIGILL on older server CPUs / VMs without AVX2.
 RUN pip install --no-cache-dir \
-    torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    torch==1.13.1+cpu torchvision==0.14.1+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu
 # Install easyocr without its torch/torchvision deps (already installed above)
 RUN pip install --no-cache-dir --no-deps easyocr
-# Install remaining dependencies
+# Install remaining dependencies (easyocr deps + transformers for TrOCR)
 RUN pip install --no-cache-dir \
-    transformers \
+    transformers==4.30.2 \
     Pillow \
     opencv-python-headless \
     numpy \
@@ -64,16 +58,12 @@ RUN pip install --no-cache-dir \
     pyclipper \
     shapely \
     python-bidi \
-    PyYAML \
-    ninja
+    PyYAML
 
 WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/ocr-server .
-
-# Copy NNPACK stub library from builder
-COPY --from=builder /tmp/libstub_nnpack.so /usr/local/lib/libstub_nnpack.so
 
 # Copy scripts directory (needed by Python OCR inference)
 COPY scripts/ ./scripts/
@@ -86,8 +76,6 @@ ENV PORT=8080 \
     MODEL_PATH=/app/models \
     GIN_MODE=release \
     PYTHON_PATH=python3 \
-    LD_PRELOAD=/usr/local/lib/libstub_nnpack.so \
-    NNPACK_DISABLE=1 \
     OMP_NUM_THREADS=2 \
     MKL_NUM_THREADS=2
 

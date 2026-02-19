@@ -600,11 +600,11 @@ def recognize_trocr(image_bytes):
     }
 
 
-def recognize_image(image_bytes, engine="easyocr"):
-    """Run OCR with full crash protection."""
+def _recognize_image_impl(image_bytes, engine="easyocr"):
+    """Internal OCR implementation — runs inside a subprocess for crash isolation."""
     import traceback
     try:
-        print(f"[PythonOCR] recognize_image called: engine={engine}, size={len(image_bytes)} bytes",
+        print(f"[PythonOCR] _recognize_image_impl: engine={engine}, size={len(image_bytes)} bytes",
               file=sys.stderr, flush=True)
         t0 = time.time()
         if engine == "trocr":
@@ -617,8 +617,66 @@ def recognize_image(image_bytes, engine="easyocr"):
         return result
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[PythonOCR] ERROR in recognize_image: {e}\n{tb}", file=sys.stderr, flush=True)
+        print(f"[PythonOCR] ERROR in _recognize_image_impl: {e}\n{tb}", file=sys.stderr, flush=True)
         return {"success": False, "error": str(e)}
+
+
+def _ocr_subprocess_worker(image_bytes, engine, result_queue):
+    """Worker function that runs in a forked child process."""
+    try:
+        import torch
+        torch.set_num_threads(1)  # Safe single-threaded mode after fork
+    except Exception:
+        pass
+    try:
+        result = _recognize_image_impl(image_bytes, engine)
+        result_queue.put(result)
+    except Exception as e:
+        result_queue.put({"success": False, "error": str(e)})
+
+
+def recognize_image(image_bytes, engine="easyocr"):
+    """Crash-safe OCR wrapper: runs inference in a forked subprocess.
+
+    If the OCR code triggers a SIGILL/SIGSEGV (e.g. CPU doesn't support
+    required instructions), only the child process dies. The HTTP server
+    parent stays alive and returns a proper error response.
+    """
+    import multiprocessing
+
+    print(f"[PythonOCR] recognize_image called: engine={engine}, size={len(image_bytes)} bytes",
+          file=sys.stderr, flush=True)
+
+    ctx = multiprocessing.get_context("fork")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_ocr_subprocess_worker,
+        args=(image_bytes, engine, result_queue),
+    )
+    proc.start()
+    proc.join(timeout=180)  # 3 minute timeout
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        print("[PythonOCR] OCR subprocess timed out (180s), killed.", file=sys.stderr, flush=True)
+        return {"success": False, "error": "OCR timed out after 180 seconds"}
+
+    if proc.exitcode != 0:
+        sig = -proc.exitcode if proc.exitcode < 0 else proc.exitcode
+        print(f"[PythonOCR] OCR subprocess crashed with exit code {proc.exitcode} (signal {sig})",
+              file=sys.stderr, flush=True)
+        return {
+            "success": False,
+            "error": f"OCR process crashed (signal {sig}). "
+                     f"Server CPU may not support required instructions.",
+        }
+
+    try:
+        result = result_queue.get_nowait()
+        return result
+    except Exception:
+        return {"success": False, "error": "OCR subprocess produced no result"}
 
 
 def warmup_ocr():
