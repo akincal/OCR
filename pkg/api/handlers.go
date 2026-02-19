@@ -107,8 +107,11 @@ func (h *Handler) RecognizeText(c *gin.Context) {
 		return
 	}
 
+	// Get engine parameter from query string (default: tesseract)
+	engine := c.DefaultQuery("engine", "tesseract")
+
 	// Perform OCR
-	result, err := h.ocrEngine.RecognizeFromBytes(fileBytes)
+	result, err := h.ocrEngine.RecognizeFromBytes(fileBytes, engine)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, OCRResponse{
 			Success:        false,
@@ -159,6 +162,9 @@ func (h *Handler) RecognizeTextBatch(c *gin.Context) {
 		return
 	}
 
+	// Get engine parameter from query string (default: tesseract)
+	engine := c.DefaultQuery("engine", "tesseract")
+
 	var results []*ocr.OCRResult
 	for _, fileHeader := range files {
 		file, err := fileHeader.Open()
@@ -171,7 +177,7 @@ func (h *Handler) RecognizeTextBatch(c *gin.Context) {
 			continue
 		}
 
-		result, err := h.ocrEngine.RecognizeFromBytes(fileBytes)
+		result, err := h.ocrEngine.RecognizeFromBytes(fileBytes, engine)
 		if err != nil {
 			results = append(results, &ocr.OCRResult{
 				Success: false,
@@ -223,8 +229,11 @@ func (h *Handler) RecognizeTextJSON(c *gin.Context) {
 		return
 	}
 
+	// Get engine parameter from query string (default: tesseract)
+	engine := c.DefaultQuery("engine", "tesseract")
+
 	// Perform OCR
-	result, err := h.ocrEngine.RecognizeFromBytes(imageBytes)
+	result, err := h.ocrEngine.RecognizeFromBytes(imageBytes, engine)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, OCRResponse{
 			Success:        false,

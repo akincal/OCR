@@ -162,21 +162,25 @@ func (e *TrOCREngine) ensureServer() error {
 }
 
 // RecognizeFromBytes performs OCR on image bytes via HTTP to Python server
-func (e *TrOCREngine) RecognizeFromBytes(imageBytes []byte) (*OCRResult, error) {
+func (e *TrOCREngine) RecognizeFromBytes(imageBytes []byte, engine string) (*OCRResult, error) {
+	if engine == "" {
+		engine = "tesseract"
+	}
+
 	if e.serverMode {
 		// Ensure the Python server is alive; restart if needed
 		if err := e.ensureServer(); err != nil {
 			return nil, fmt.Errorf("OCR server unavailable: %w", err)
 		}
 
-		result, err := e.recognizeViaServer(imageBytes)
+		result, err := e.recognizeViaServer(imageBytes, engine)
 		if err != nil {
 			// Connection may have been lost mid-request — try one restart
 			log.Printf("[OCR] Request failed, attempting server restart: %v", err)
 			if restartErr := e.ensureServer(); restartErr != nil {
 				return nil, fmt.Errorf("OCR server restart failed: %w", restartErr)
 			}
-			return e.recognizeViaServer(imageBytes)
+			return e.recognizeViaServer(imageBytes, engine)
 		}
 		return result, nil
 	}
@@ -188,7 +192,7 @@ func (e *TrOCREngine) RecognizeFromBytes(imageBytes []byte) (*OCRResult, error) 
 }
 
 // recognizeViaServer sends image to Python HTTP server
-func (e *TrOCREngine) recognizeViaServer(imageBytes []byte) (*OCRResult, error) {
+func (e *TrOCREngine) recognizeViaServer(imageBytes []byte, engine string) (*OCRResult, error) {
 	// Use a dedicated client with a long timeout — OCR on CPU can take minutes
 	client := &http.Client{
 		Timeout: 5 * time.Minute,
@@ -197,7 +201,8 @@ func (e *TrOCREngine) recognizeViaServer(imageBytes []byte) (*OCRResult, error) 
 		},
 	}
 
-	req, err := http.NewRequest("POST", e.serverURL+"/ocr", bytes.NewReader(imageBytes))
+	ocrURL := fmt.Sprintf("%s/ocr?engine=%s", e.serverURL, engine)
+	req, err := http.NewRequest("POST", ocrURL, bytes.NewReader(imageBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -257,12 +262,12 @@ func (e *TrOCREngine) recognizeViaSubprocess(imageBytes []byte) (*OCRResult, err
 }
 
 // RecognizeFromFile performs OCR on an image file
-func (e *TrOCREngine) RecognizeFromFile(imagePath string) (*OCRResult, error) {
+func (e *TrOCREngine) RecognizeFromFile(imagePath string, engine string) (*OCRResult, error) {
 	imageBytes, err := os.ReadFile(imagePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read image file: %w", err)
 	}
-	return e.RecognizeFromBytes(imageBytes)
+	return e.RecognizeFromBytes(imageBytes, engine)
 }
 
 // Close stops the Python server
