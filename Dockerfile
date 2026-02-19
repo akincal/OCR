@@ -1,15 +1,14 @@
 # Multi-stage build for OCR API
 
-# Stage 1: Build stage
-FROM golang:1.21-alpine AS builder
+# Stage 1: Build Go binary
+FROM golang:1.21-bookworm AS builder
 
 # Install build dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    build-base \
-    pkgconfig \
-    opencv-dev \
-    cmake
+    build-essential \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -23,47 +22,82 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o /app/ocr-server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/ocr-server ./cmd/server
 
-# Stage 2: Runtime stage
-FROM alpine:latest
+# Stage 2: Runtime stage with Python
+FROM python:3.10-slim-bookworm
 
-# Install runtime dependencies
-RUN apk add --no-cache \
-    opencv \
-    libstdc++ \
+# Install Tesseract OCR and runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
     ca-certificates \
-    wget
+    wget \
+    tesseract-ocr \
+    tesseract-ocr-tur \
+    tesseract-ocr-eng \
+    libtesseract-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install ONNX Runtime
-WORKDIR /tmp
-RUN wget https://github.com/microsoft/onnxruntime/releases/download/v1.16.3/onnxruntime-linux-x64-1.16.3.tgz && \
-    tar -xzf onnxruntime-linux-x64-1.16.3.tgz && \
-    cp -r onnxruntime-linux-x64-1.16.3/lib/* /usr/local/lib/ && \
-    cp -r onnxruntime-linux-x64-1.16.3/include/* /usr/local/include/ && \
-    ldconfig /usr/local/lib && \
-    rm -rf /tmp/*
+# Install CPU-compatible Python packages (for Tesseract)
+RUN pip install --no-cache-dir \
+    pytesseract==0.3.10 \
+    Pillow==10.2.0 \
+    numpy==1.24.3 \
+    opencv-python-headless==4.8.1.78
+# Note: NumPy 1.24.3 is the last version without mandatory AVX2 CPU instructions
+
+# Install PyTorch and EasyOCR/TrOCR dependencies (optional engines)
+# torch 1.13.1+cpu is the last version that does NOT require AVX2 CPU instructions.
+# PyTorch 2.x wheels use AVX2 which causes SIGILL on older server CPUs / VMs without AVX2.
+RUN pip install --no-cache-dir \
+    torch==1.13.1+cpu torchvision==0.14.1+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Install easyocr without its torch/torchvision deps (already installed above)
+RUN pip install --no-cache-dir --no-deps easyocr
+
+# Install remaining dependencies (easyocr deps + transformers for TrOCR)
+RUN pip install --no-cache-dir \
+    transformers==4.30.2 \
+    scikit-image \
+    scipy \
+    pyclipper \
+    shapely \
+    python-bidi \
+    PyYAML
 
 WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/ocr-server .
 
-# Create models directory
-RUN mkdir -p /app/models
+# Copy scripts directory (needed by Python OCR inference)
+COPY scripts/ ./scripts/
+
+# Create models and uploads directories
+RUN mkdir -p /app/models /app/uploads
 
 # Set environment variables
 ENV PORT=8080 \
     MODEL_PATH=/app/models \
     GIN_MODE=release \
-    LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+    PYTHON_PATH=python3 \
+    NNPACK_DISABLE=1 \
+    OPENBLAS_NUM_THREADS=2 \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    TOKENIZERS_PARALLELISM=false
 
 # Expose port
 EXPOSE 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD wget --no-verbose --tries=1 -O /dev/null http://localhost:8080/health || exit 1
 
 # Run the application
 CMD ["./ocr-server"]

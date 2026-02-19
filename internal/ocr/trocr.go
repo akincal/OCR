@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -30,6 +31,7 @@ type TrOCREngine struct {
 	serverMode    bool
 	serverProcess *exec.Cmd
 	initialized   bool
+	processAlive  bool
 	mu            sync.Mutex
 }
 
@@ -51,7 +53,7 @@ func (e *TrOCREngine) Initialize() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.initialized {
+	if e.initialized && e.processAlive {
 		return nil
 	}
 
@@ -68,29 +70,60 @@ func (e *TrOCREngine) Initialize() error {
 	}
 
 	e.initialized = true
+	e.processAlive = true
 	return nil
 }
 
 // startServer launches the Python OCR inference server
 func (e *TrOCREngine) startServer() error {
+	// Kill any previous process
+	if e.serverProcess != nil && e.serverProcess.Process != nil {
+		_ = e.serverProcess.Process.Kill()
+		_ = e.serverProcess.Wait()
+		e.serverProcess = nil
+	}
+
 	cmd := exec.Command(e.pythonPath, e.scriptPath, "--server", "--port", "5555")
+	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start OCR server: %w", err)
 	}
 	e.serverProcess = cmd
+	e.processAlive = true
+	log.Printf("[OCR] Python server process started (PID: %d)", cmd.Process.Pid)
+
+	// Monitor the process in background — detect crashes
+	go func() {
+		err := cmd.Wait()
+		e.mu.Lock()
+		e.processAlive = false
+		e.initialized = false
+		e.mu.Unlock()
+		if err != nil {
+			log.Printf("[OCR] Python server process (PID: %d) exited with error: %v", cmd.Process.Pid, err)
+		} else {
+			log.Printf("[OCR] Python server process (PID: %d) exited normally", cmd.Process.Pid)
+		}
+	}()
 
 	// Wait for server to be ready
-	maxRetries := 60 // Model loading can take a while
+	maxRetries := 90 // Model loading can take a while (up to 3 minutes)
 	for i := 0; i < maxRetries; i++ {
 		time.Sleep(2 * time.Second)
+
+		// Check if process is still alive
+		if !e.processAlive {
+			return fmt.Errorf("OCR server process crashed during startup")
+		}
 
 		resp, err := http.Get(e.serverURL + "/health")
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
 				e.initialized = true
+				log.Printf("[OCR] Python server is ready at %s", e.serverURL)
 				return nil
 			}
 		}
@@ -99,21 +132,85 @@ func (e *TrOCREngine) startServer() error {
 	return fmt.Errorf("OCR server failed to start within timeout")
 }
 
+// ensureServer checks if the Python server is alive and restarts it if needed
+func (e *TrOCREngine) ensureServer() error {
+	e.mu.Lock()
+	alive := e.processAlive
+	e.mu.Unlock()
+
+	if alive {
+		// Quick health check
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(e.serverURL + "/health")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return nil
+			}
+		}
+	}
+
+	// Server is down — restart it
+	log.Println("[OCR] Python server is not responding, restarting...")
+	e.mu.Lock()
+	e.initialized = false
+	e.processAlive = false
+	e.mu.Unlock()
+
+	// Re-initialize (will call startServer)
+	return e.Initialize()
+}
+
 // RecognizeFromBytes performs OCR on image bytes via HTTP to Python server
-func (e *TrOCREngine) RecognizeFromBytes(imageBytes []byte) (*OCRResult, error) {
-	if !e.initialized {
-		return nil, fmt.Errorf("engine not initialized")
+func (e *TrOCREngine) RecognizeFromBytes(imageBytes []byte, engine string) (*OCRResult, error) {
+	if engine == "" {
+		engine = "tesseract"
 	}
 
 	if e.serverMode {
-		return e.recognizeViaServer(imageBytes)
+		// Ensure the Python server is alive; restart if needed
+		if err := e.ensureServer(); err != nil {
+			return nil, fmt.Errorf("OCR server unavailable: %w", err)
+		}
+
+		result, err := e.recognizeViaServer(imageBytes, engine)
+		if err != nil {
+			// Connection may have been lost mid-request — try one restart
+			log.Printf("[OCR] Request failed, attempting server restart: %v", err)
+			if restartErr := e.ensureServer(); restartErr != nil {
+				return nil, fmt.Errorf("OCR server restart failed: %w", restartErr)
+			}
+			return e.recognizeViaServer(imageBytes, engine)
+		}
+		return result, nil
+	}
+
+	if !e.initialized {
+		return nil, fmt.Errorf("engine not initialized")
 	}
 	return e.recognizeViaSubprocess(imageBytes)
 }
 
 // recognizeViaServer sends image to Python HTTP server
-func (e *TrOCREngine) recognizeViaServer(imageBytes []byte) (*OCRResult, error) {
-	resp, err := http.Post(e.serverURL+"/ocr", "application/octet-stream", bytes.NewReader(imageBytes))
+func (e *TrOCREngine) recognizeViaServer(imageBytes []byte, engine string) (*OCRResult, error) {
+	// Use a dedicated client with a long timeout — OCR on CPU can take minutes
+	client := &http.Client{
+		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{
+			DisableKeepAlives: true, // Use fresh connection each time
+		},
+	}
+
+	ocrURL := fmt.Sprintf("%s/ocr?engine=%s", e.serverURL, engine)
+	req, err := http.NewRequest("POST", ocrURL, bytes.NewReader(imageBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Connection", "close")
+
+	log.Printf("[OCR] Sending %d bytes to Python server...", len(imageBytes))
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call OCR server: %w", err)
 	}
@@ -124,9 +221,11 @@ func (e *TrOCREngine) recognizeViaServer(imageBytes []byte) (*OCRResult, error) 
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	log.Printf("[OCR] Got response (%d bytes, status %d)", len(body), resp.StatusCode)
+
 	var result OCRResult
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("failed to parse response (body=%q): %w", string(body[:min(len(body), 200)]), err)
 	}
 
 	return &result, nil
@@ -163,12 +262,12 @@ func (e *TrOCREngine) recognizeViaSubprocess(imageBytes []byte) (*OCRResult, err
 }
 
 // RecognizeFromFile performs OCR on an image file
-func (e *TrOCREngine) RecognizeFromFile(imagePath string) (*OCRResult, error) {
+func (e *TrOCREngine) RecognizeFromFile(imagePath string, engine string) (*OCRResult, error) {
 	imageBytes, err := os.ReadFile(imagePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read image file: %w", err)
 	}
-	return e.RecognizeFromBytes(imageBytes)
+	return e.RecognizeFromBytes(imageBytes, engine)
 }
 
 // Close stops the Python server

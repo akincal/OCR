@@ -8,6 +8,7 @@ import (
 func SetupRoutes(router *gin.Engine, handler *Handler) {
 	// Health check
 	router.GET("/health", handler.HealthCheck)
+	router.HEAD("/health", handler.HealthCheck)
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"message": "OCR API Server",
