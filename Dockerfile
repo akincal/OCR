@@ -46,10 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
     pytesseract==0.3.10 \
     Pillow==10.2.0 \
-    numpy==1.24.3
-
-# Install OpenCV from source for SSE4 compatibility
-RUN pip install --no-cache-dir --no-binary opencv-python-headless opencv-python-headless==4.8.1.78
+    numpy==1.24.3 \
+    opencv-python-headless==4.8.1.78
 
 # Install PyTorch and EasyOCR/TrOCR dependencies (optional engines)
 # torch 1.13.1+cpu is the last version that does NOT require AVX2 CPU instructions.
