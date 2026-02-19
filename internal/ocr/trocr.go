@@ -276,8 +276,8 @@ func (e *TrOCREngine) Close() error {
 // GetModelInfo returns information about the model
 func (e *TrOCREngine) GetModelInfo() map[string]interface{} {
 	return map[string]interface{}{
-		"model":       "microsoft/trocr-base-handwritten",
-		"runtime":     "Python + PyTorch",
+		"model":       "Tesseract OCR (tur+eng)",
+		"runtime":     "Python + Tesseract",
 		"script":      filepath.Base(e.scriptPath),
 		"server_mode": e.serverMode,
 		"server_url":  e.serverURL,

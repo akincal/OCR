@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-OCR Inference Script - Dual Engine (EasyOCR + TrOCR)
+OCR Inference Script — Tesseract Engine
 With document detection, perspective correction, and post-processing.
 
 Pipeline:
   1. Document/paper region detection (removes background noise)
   2. Perspective correction (fixes tilted papers)
   3. Image enhancement (contrast, sharpness, denoise)
-  4. OCR (EasyOCR or TrOCR)
+  4. OCR via Tesseract (supports Turkish + English)
   5. Post-processing (spelling correction, confidence filtering)
 """
 
@@ -19,68 +19,40 @@ import io
 import math
 import time
 
-# Disable NNPACK — causes crashes on unsupported hardware (Docker/VM CPUs)
-os.environ["NNPACK_DISABLE"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["OMP_NUM_THREADS"] = "2"  # Limit OpenMP threads to avoid memory spikes
+os.environ["OMP_NUM_THREADS"] = "2"
 os.environ["MKL_NUM_THREADS"] = "2"
 import warnings
 warnings.filterwarnings("ignore")
 
-# Global model caches
-_easyocr_reader = None
-_trocr_processor = None
-_trocr_model = None
+# Global state
+_tesseract_verified = False
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Tesseract verification
 # ---------------------------------------------------------------------------
 
-def load_easyocr(langs=None):
-    global _easyocr_reader
-    if _easyocr_reader is not None:
-        return _easyocr_reader
+def verify_tesseract():
+    """Verify Tesseract is installed and Turkish language data is available."""
+    global _tesseract_verified
+    if _tesseract_verified:
+        return
 
-    import easyocr
-
-    # Disable NNPACK in PyTorch to prevent crashes on unsupported CPUs
+    import pytesseract
+    # Check tesseract binary
     try:
-        import torch
-        if hasattr(torch.backends, "nnpack"):
-            torch.backends.nnpack.enabled = False
-            print("[PythonOCR] NNPACK disabled", file=sys.stderr, flush=True)
-    except Exception:
-        pass
+        version = pytesseract.get_tesseract_version()
+        print(f"[PythonOCR] Tesseract version: {version}", file=sys.stderr, flush=True)
+    except Exception as e:
+        raise RuntimeError(f"Tesseract not found: {e}")
 
-    if langs is None:
-        langs = ["tr", "en"]
+    # Check available languages
+    langs = pytesseract.get_languages()
+    print(f"[PythonOCR] Available languages: {langs}", file=sys.stderr, flush=True)
+    if "tur" not in langs:
+        print("[PythonOCR] WARNING: Turkish (tur) language data not installed!", file=sys.stderr, flush=True)
 
-    cache_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
-    )
-    os.makedirs(cache_dir, exist_ok=True)
-
-    _easyocr_reader = easyocr.Reader(
-        langs, gpu=False, model_storage_directory=cache_dir,
-    )
-    return _easyocr_reader
-
-
-def load_trocr():
-    global _trocr_processor, _trocr_model
-    if _trocr_processor is not None and _trocr_model is not None:
-        return _trocr_processor, _trocr_model
-
-    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-    model_name = "microsoft/trocr-base-handwritten"
-    cache_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
-    )
-    _trocr_processor = TrOCRProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-    _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name, cache_dir=cache_dir)
-    _trocr_model.eval()
-    return _trocr_processor, _trocr_model
+    _tesseract_verified = True
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +394,11 @@ def filter_noise_detections(detections, image_width, image_height):
 # OCR engines
 # ---------------------------------------------------------------------------
 
-def recognize_easyocr(image_bytes):
-    """Full pipeline: detect doc -> preprocess -> OCR -> post-process"""
+def recognize_tesseract(image_bytes):
+    """Full pipeline: detect doc -> preprocess -> Tesseract OCR -> post-process.
+    Uses Tesseract (pure C++ engine) — works on any CPU, no PyTorch needed."""
     import numpy as np
+    import pytesseract
     from PIL import Image
 
     # Validate image size (reject files > 20MB to prevent OOM)
@@ -436,7 +410,7 @@ def recognize_easyocr(image_bytes):
 
     image = Image.open(io.BytesIO(image_bytes))
 
-    # Limit image dimensions to prevent memory issues on CPU
+    # Limit image dimensions to prevent memory issues
     max_pixels = 4096
     if max(image.size) > max_pixels:
         ratio = max_pixels / max(image.size)
@@ -453,67 +427,82 @@ def recognize_easyocr(image_bytes):
     # Step 3: Fix orientation
     doc_image = ensure_correct_orientation(doc_image)
 
-    # Convert to numpy array for EasyOCR
-    img_array = np.array(doc_image)
+    # Step 4: Run Tesseract OCR (Turkish + English)
+    # Use --oem 3 (default LSTM engine) and --psm 6 (assume uniform block of text)
+    custom_config = r"--oem 3 --psm 6"
+    lang = "tur+eng"
 
-    reader = load_easyocr()
+    # Get detailed data with bounding boxes and confidence
+    try:
+        data = pytesseract.image_to_data(
+            doc_image, lang=lang, config=custom_config, output_type=pytesseract.Output.DICT
+        )
+    except Exception as e:
+        # Fallback: try English only
+        print(f"[PythonOCR] Tesseract tur+eng failed: {e}, trying eng only", file=sys.stderr, flush=True)
+        data = pytesseract.image_to_data(
+            doc_image, lang="eng", config=custom_config, output_type=pytesseract.Output.DICT
+        )
 
-    # Step 4: Run OCR with optimized parameters
-    results = reader.readtext(
-        img_array,
-        detail=1,
-        paragraph=False,
-        contrast_ths=0.3,      # lower = detect more low-contrast text
-        adjust_contrast=0.7,   # auto adjust contrast
-        text_threshold=0.6,    # confidence to consider as text
-        low_text=0.3,          # text low-bound score
-        width_ths=0.7,         # max horizontal distance to merge boxes
-    )
-
-    if not results:
-        return {
-            "success": True,
-            "text": "",
-            "confidence": 0.0,
-            "lines": 0,
-            "detections": [],
-            "document_detected": detected,
-        }
-
-    # Sort by vertical then horizontal position
-    results.sort(key=lambda r: (min(p[1] for p in r[0]), min(p[0] for p in r[0])))
-
-    # Build detections list
+    # Parse Tesseract output into lines
+    n = len(data["text"])
+    lines_dict = {}  # line_num -> list of (text, conf)
     detections = []
-    for bbox, text, conf in results:
-        detections.append({
-            "text": text.strip(),
-            "confidence": round(float(conf), 4),
-            "bbox": [[int(p[0]), int(p[1])] for p in bbox],
+
+    for i in range(n):
+        text = data["text"][i].strip()
+        conf = int(data["conf"][i])
+
+        if not text or conf < 0:
+            continue
+
+        line_num = data["line_num"][i]
+        block_num = data["block_num"][i]
+        key = (block_num, line_num)
+
+        if key not in lines_dict:
+            lines_dict[key] = []
+
+        lines_dict[key].append({
+            "text": text,
+            "confidence": conf / 100.0,
+            "bbox": [[data["left"][i], data["top"][i]],
+                     [data["left"][i] + data["width"][i], data["top"][i]],
+                     [data["left"][i] + data["width"][i], data["top"][i] + data["height"][i]],
+                     [data["left"][i], data["top"][i] + data["height"][i]]],
         })
 
-    # Step 5: Filter noise
+        detections.append({
+            "text": text,
+            "confidence": round(conf / 100.0, 4),
+            "bbox": [[data["left"][i], data["top"][i]],
+                     [data["left"][i] + data["width"][i], data["top"][i]],
+                     [data["left"][i] + data["width"][i], data["top"][i] + data["height"][i]],
+                     [data["left"][i], data["top"][i] + data["height"][i]]],
+        })
+
+    # Filter noise detections
+    img_array = np.array(doc_image)
     detections = filter_noise_detections(
         detections, img_array.shape[1], img_array.shape[0]
     )
 
-    # Group into lines
-    lines = group_into_lines(detections)
-
-    # Build text
+    # Build text from lines
     line_texts = []
     all_confidences = []
 
-    for line in lines:
-        line_text = " ".join(d["text"] for d in line)
-        line_conf = sum(d["confidence"] for d in line) / len(line)
-        line_texts.append(line_text)
-        all_confidences.append(line_conf)
+    for key in sorted(lines_dict.keys()):
+        words = lines_dict[key]
+        line_text = " ".join(w["text"] for w in words)
+        line_conf = sum(w["confidence"] for w in words) / len(words)
+        if line_text.strip():
+            line_texts.append(line_text)
+            all_confidences.append(line_conf)
 
     full_text = "\n".join(line_texts)
     avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
 
-    # Step 6: Post-process (fuzzy spelling correction)
+    # Step 5: Post-process (fuzzy spelling correction)
     corrected_text = post_process_text(full_text)
 
     return {
@@ -524,188 +513,42 @@ def recognize_easyocr(image_bytes):
         "lines": len(line_texts),
         "detections": detections,
         "document_detected": detected,
+        "engine": "tesseract",
     }
 
 
-def group_into_lines(detections):
-    """Group detections into lines based on vertical proximity."""
-    if not detections:
-        return []
-
-    lines = []
-    current_line = [detections[0]]
-    last_y = get_center_y(detections[0])
-    line_threshold = 25
-
-    for det in detections[1:]:
-        y = get_center_y(det)
-
-        if abs(y - last_y) < line_threshold:
-            current_line.append(det)
-        else:
-            current_line.sort(key=lambda d: d["bbox"][0][0])
-            lines.append(current_line)
-            current_line = [det]
-
-        last_y = y
-
-    if current_line:
-        current_line.sort(key=lambda d: d["bbox"][0][0])
-        lines.append(current_line)
-
-    return lines
-
-
-def get_center_y(det):
-    return sum(p[1] for p in det["bbox"]) / len(det["bbox"])
-
-
-def recognize_trocr(image_bytes):
-    """TrOCR with document detection pipeline."""
-    import torch
-    from PIL import Image
-
-    image = Image.open(io.BytesIO(image_bytes))
-
-    # Detect and crop document region
-    doc_image, detected = detect_document_region(image)
-    doc_image = preprocess_image(doc_image)
-
-    processor, model = load_trocr()
-
-    pixel_values = processor(images=doc_image, return_tensors="pt").pixel_values
-
-    with torch.no_grad():
-        outputs = model.generate(
-            pixel_values,
-            max_length=128,
-            num_beams=4,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
-
-    text = processor.batch_decode(outputs.sequences, skip_special_tokens=True)[0].strip()
-    text = post_process_text(text)
-
-    confidence = 0.0
-    if hasattr(outputs, "sequences_scores") and outputs.sequences_scores is not None:
-        confidence = min(1.0, max(0.0, math.exp(outputs.sequences_scores[0].item())))
-
-    return {
-        "success": True,
-        "text": text,
-        "confidence": round(confidence, 4),
-        "lines": 1,
-        "document_detected": detected,
-    }
-
-
-def _recognize_image_impl(image_bytes, engine="easyocr"):
-    """Internal OCR implementation — runs inside a subprocess for crash isolation."""
+def recognize_image(image_bytes, engine="tesseract"):
+    """Run OCR using Tesseract. No subprocess needed — Tesseract is a safe C++ engine."""
     import traceback
     try:
-        print(f"[PythonOCR] _recognize_image_impl: engine={engine}, size={len(image_bytes)} bytes",
+        print(f"[PythonOCR] recognize_image called: engine=tesseract, size={len(image_bytes)} bytes",
               file=sys.stderr, flush=True)
         t0 = time.time()
-        if engine == "trocr":
-            result = recognize_trocr(image_bytes)
-        else:
-            result = recognize_easyocr(image_bytes)
+        result = recognize_tesseract(image_bytes)
         elapsed = time.time() - t0
         print(f"[PythonOCR] OCR completed in {elapsed:.1f}s, success={result.get('success')}",
               file=sys.stderr, flush=True)
         return result
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[PythonOCR] ERROR in _recognize_image_impl: {e}\n{tb}", file=sys.stderr, flush=True)
+        print(f"[PythonOCR] ERROR in recognize_image: {e}\n{tb}", file=sys.stderr, flush=True)
         return {"success": False, "error": str(e)}
 
 
-def _ocr_subprocess_worker(image_bytes, engine, result_queue):
-    """Worker function that runs in a forked child process."""
-    try:
-        import torch
-        torch.set_num_threads(1)  # Safe single-threaded mode after fork
-    except Exception:
-        pass
-    try:
-        result = _recognize_image_impl(image_bytes, engine)
-        result_queue.put(result)
-    except Exception as e:
-        result_queue.put({"success": False, "error": str(e)})
-
-
-def recognize_image(image_bytes, engine="easyocr"):
-    """Crash-safe OCR wrapper: runs inference in a forked subprocess.
-
-    If the OCR code triggers a SIGILL/SIGSEGV (e.g. CPU doesn't support
-    required instructions), only the child process dies. The HTTP server
-    parent stays alive and returns a proper error response.
-    """
-    import multiprocessing
-
-    print(f"[PythonOCR] recognize_image called: engine={engine}, size={len(image_bytes)} bytes",
-          file=sys.stderr, flush=True)
-
-    ctx = multiprocessing.get_context("fork")
-    result_queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_ocr_subprocess_worker,
-        args=(image_bytes, engine, result_queue),
-    )
-    proc.start()
-    proc.join(timeout=180)  # 3 minute timeout
-
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
-        print("[PythonOCR] OCR subprocess timed out (180s), killed.", file=sys.stderr, flush=True)
-        return {"success": False, "error": "OCR timed out after 180 seconds"}
-
-    if proc.exitcode != 0:
-        sig = -proc.exitcode if proc.exitcode < 0 else proc.exitcode
-        print(f"[PythonOCR] OCR subprocess crashed with exit code {proc.exitcode} (signal {sig})",
-              file=sys.stderr, flush=True)
-        return {
-            "success": False,
-            "error": f"OCR process crashed (signal {sig}). "
-                     f"Server CPU may not support required instructions.",
-        }
-
-    try:
-        result = result_queue.get_nowait()
-        return result
-    except Exception:
-        return {"success": False, "error": "OCR subprocess produced no result"}
-
-
 def warmup_ocr():
-    """Run a realistic-sized dummy image through the full EasyOCR pipeline.
-    Uses a 640x480 image (similar to real photos) to trigger ALL code paths
-    including CRAFT detector convolutions that use NNPACK on larger images.
-    If NNPACK crashes, it happens here at startup instead of on first request."""
-    import numpy as np
+    """Run a small dummy image through Tesseract to verify it works."""
     from PIL import Image, ImageDraw
+    import pytesseract
 
-    print("[PythonOCR] Running warm-up inference (640x480)...", file=sys.stderr, flush=True)
+    print("[PythonOCR] Running Tesseract warm-up...", file=sys.stderr, flush=True)
     try:
-        # Create a realistically-sized image with text-like patterns
-        img = Image.new("RGB", (640, 480), color=(255, 255, 255))
+        img = Image.new("RGB", (200, 50), color=(255, 255, 255))
         draw = ImageDraw.Draw(img)
-        # Draw several lines of dark rectangles (simulates text lines)
-        for row in range(5):
-            y = 50 + row * 60
-            for col in range(8):
-                x = 30 + col * 70
-                draw.rectangle([x, y, x + 50, y + 20], fill=(0, 0, 0))
-
-        img_array = np.array(img)
-        reader = load_easyocr()
-        _ = reader.readtext(img_array, detail=0)
-        print("[PythonOCR] Warm-up inference completed successfully!", file=sys.stderr, flush=True)
+        draw.text((10, 10), "Test 123", fill=(0, 0, 0))
+        text = pytesseract.image_to_string(img, lang="eng").strip()
+        print(f"[PythonOCR] Warm-up result: '{text}' — Tesseract is working!", file=sys.stderr, flush=True)
     except Exception as e:
-        print(f"[PythonOCR] WARNING: Warm-up inference failed: {e}", file=sys.stderr, flush=True)
-        print("[PythonOCR] OCR requests may crash. Check CPU compatibility.", file=sys.stderr, flush=True)
+        print(f"[PythonOCR] WARNING: Tesseract warm-up failed: {e}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -719,12 +562,11 @@ def run_server(port=5555):
     import traceback
     import threading
 
-    print("[PythonOCR] Loading EasyOCR model (tr+en)...", file=sys.stderr, flush=True)
-    load_easyocr()
-    print("[PythonOCR] EasyOCR model loaded!", file=sys.stderr, flush=True)
+    print("[PythonOCR] Verifying Tesseract installation...", file=sys.stderr, flush=True)
+    verify_tesseract()
+    print("[PythonOCR] Tesseract verified!", file=sys.stderr, flush=True)
 
-    # Pre-warm: run a dummy inference to fully initialize PyTorch/NNPACK/OpenCV
-    # This catches segfaults at startup instead of on the first real request
+    # Pre-warm: run a dummy inference to verify everything works
     warmup_ocr()
 
     class OCRHandler(BaseHTTPRequestHandler):
@@ -748,12 +590,12 @@ def run_server(port=5555):
 
                 parsed = urllib.parse.urlparse(self.path)
                 params = urllib.parse.parse_qs(parsed.query)
-                engine = params.get("engine", ["easyocr"])[0]
+                engine = params.get("engine", ["tesseract"])[0]
 
                 if parsed.path == "/ocr":
                     result = recognize_image(body, engine=engine)
                 elif parsed.path == "/health":
-                    result = {"status": "healthy", "engine": "easyocr+trocr"}
+                    result = {"status": "healthy", "engine": "tesseract"}
                 else:
                     result = {"success": False, "error": "Unknown endpoint"}
 
@@ -780,7 +622,7 @@ def run_server(port=5555):
 
         def do_GET(self):
             if self.path == "/health":
-                self._send_json({"status": "healthy", "engine": "easyocr+trocr"})
+                self._send_json({"status": "healthy", "engine": "tesseract"})
             else:
                 self._send_json({"error": "Not found"})
 
@@ -796,7 +638,7 @@ def run_server(port=5555):
 def main():
     parser = argparse.ArgumentParser(description="OCR Inference")
     parser.add_argument("image", nargs="?", help="Path to image file")
-    parser.add_argument("--engine", default="easyocr", choices=["easyocr", "trocr"])
+    parser.add_argument("--engine", default="tesseract", choices=["tesseract"])
     parser.add_argument("--server", action="store_true")
     parser.add_argument("--port", type=int, default=5555)
     args = parser.parse_args()
