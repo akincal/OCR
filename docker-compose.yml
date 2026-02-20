@@ -1,0 +1,32 @@
+services:
+  ocr-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ocr-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models
+      - ./uploads:/app/uploads
+      - ./training_data:/app/training_data
+    environment:
+      - PORT=8080
+      - MODEL_PATH=/app/models
+      - GIN_MODE=release
+      - PYTHON_PATH=python3
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
