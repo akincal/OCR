@@ -162,7 +162,7 @@ def train(args):
         warmup_steps=min(500, train_size // args.batch_size),
         weight_decay=0.01,
         fp16=torch.cuda.is_available(),
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=3,
         load_best_model_at_end=True,

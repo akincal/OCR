@@ -24,9 +24,17 @@ models/
 
 # Python virtual environment
 venv/
+__pycache__/
+*.pyc
 
 # Upload directory
 uploads/
+
+# Training data (generated datasets)
+training_data/
+
+# Debug / visualization images
+deneme*.png
 
 # IDE specific files
 .vscode/

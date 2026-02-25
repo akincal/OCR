@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OCR Inference Script - Multi-Engine (Tesseract + EasyOCR + TrOCR + PaddleOCR + Ensemble)
-With document detection, perspective correction, advanced preprocessing, and NLP post-processing.
+With document detection, perspective correction, and advanced preprocessing.
 
 Pipeline:
   1. Document/paper region detection (removes background noise)
@@ -10,7 +10,7 @@ Pipeline:
   4. Advanced preprocessing (deskew, binarization, CLAHE, denoising)
   5. Orientation detection (Tesseract OSD + heuristic)
   6. OCR (Tesseract / EasyOCR / TrOCR / PaddleOCR / Ensemble)
-  7. Post-processing (structural fixes, NLP spelling, confidence calibration)
+  7. Post-processing (structural regex fixes only)
 """
 
 import sys
@@ -34,7 +34,6 @@ _easyocr_reader = None
 _trocr_processor = None
 _trocr_model = None
 _paddleocr_engine = None
-_hunspell_dict = None
 
 
 # ---------------------------------------------------------------------------
@@ -81,13 +80,10 @@ def load_trocr():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
     )
 
-    custom_model_path = os.path.join(cache_dir, "trocr-turkish")
-    if os.path.isdir(custom_model_path):
-        model_name = custom_model_path
-        print(f"[PythonOCR] Loading fine-tuned TrOCR from {custom_model_path}", file=sys.stderr, flush=True)
-    else:
-        model_name = "microsoft/trocr-base-printed"
-        print(f"[PythonOCR] Loading base TrOCR: {model_name}", file=sys.stderr, flush=True)
+    # Keep TrOCR behavior aligned with the minimal HF flow:
+    # load the model directly from Hugging Face unless explicitly overridden.
+    model_name = os.getenv("TROCR_MODEL_NAME", "microsoft/trocr-base-handwritten")
+    print(f"[PythonOCR] Loading TrOCR model: {model_name}", file=sys.stderr, flush=True)
 
     _trocr_processor = TrOCRProcessor.from_pretrained(model_name, cache_dir=cache_dir)
     _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name, cache_dir=cache_dir)
@@ -117,38 +113,6 @@ def load_paddleocr():
     )
     return _paddleocr_engine
 
-
-def load_hunspell():
-    global _hunspell_dict
-    if _hunspell_dict is not None:
-        return _hunspell_dict
-
-    try:
-        import hunspell
-        dic_paths = [
-            "/usr/share/hunspell/tr_TR.dic",
-            "/usr/share/myspell/tr_TR.dic",
-        ]
-        aff_paths = [
-            "/usr/share/hunspell/tr_TR.aff",
-            "/usr/share/myspell/tr_TR.aff",
-        ]
-        dic_path = next((p for p in dic_paths if os.path.exists(p)), None)
-        aff_path = next((p for p in aff_paths if os.path.exists(p)), None)
-
-        if dic_path and aff_path:
-            _hunspell_dict = hunspell.HunSpell(dic_path, aff_path)
-            print("[PythonOCR] Hunspell Turkish dictionary loaded", file=sys.stderr, flush=True)
-        else:
-            print("[PythonOCR] Hunspell dictionary files not found, skipping NLP spell check",
-                  file=sys.stderr, flush=True)
-    except ImportError:
-        print("[PythonOCR] pyhunspell not installed, skipping NLP spell check",
-              file=sys.stderr, flush=True)
-    except Exception as e:
-        print(f"[PythonOCR] Hunspell init failed: {e}", file=sys.stderr, flush=True)
-
-    return _hunspell_dict
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +255,7 @@ def deskew_image(image):
     """Correct skew angle using minAreaRect on text pixels."""
     import numpy as np
     import cv2
+    import sys
 
     img_array = np.array(image)
     if len(img_array.shape) == 3:
@@ -299,6 +264,19 @@ def deskew_image(image):
         gray = img_array.copy()
 
     binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+    # If a near-full-width horizontal stroke is present (e.g. underlines),
+    # minAreaRect can over-estimate skew on otherwise straight images.
+    h, w = gray.shape[:2]
+    row_ink = np.sum(binary > 0, axis=1)
+    strong_rows = row_ink > (0.6 * w)
+    if np.any(strong_rows):
+        strong_count = int(np.count_nonzero(strong_rows))
+        if strong_count <= max(3, int(0.01 * h)):
+            print("[PythonOCR] Deskew skipped: horizontal-line dominant rows detected",
+                  file=sys.stderr, flush=True)
+            return image
+
     coords = np.column_stack(np.where(binary > 0))
 
     if len(coords) < 100:
@@ -310,10 +288,11 @@ def deskew_image(image):
     else:
         angle = -angle
 
-    if abs(angle) < 0.3 or abs(angle) > 20:
+    # Conservative deskew for mostly-straight mobile captures.
+    if abs(angle) < 0.8 or abs(angle) > 5:
+        print(f"[PythonOCR] Deskew skipped: estimated angle={angle:.2f}°", file=sys.stderr, flush=True)
         return image
 
-    h, w = img_array.shape[:2]
     center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
     rotated = cv2.warpAffine(
@@ -323,6 +302,7 @@ def deskew_image(image):
     )
 
     from PIL import Image as PILImage
+    print(f"[PythonOCR] Deskew applied: angle={angle:.2f}°", file=sys.stderr, flush=True)
     return PILImage.fromarray(rotated)
 
 
@@ -353,12 +333,19 @@ def preprocess_image(image, quality=None):
     """Advanced preprocessing pipeline with adaptive parameters."""
     import numpy as np
     import cv2
-    from PIL import ImageEnhance, ImageOps, ImageFilter
+    from PIL import Image, ImageEnhance, ImageOps, ImageFilter
 
     if image.mode != "RGB":
         image = image.convert("RGB")
 
     image = ImageOps.exif_transpose(image)
+
+    # Upscale small images for better OCR accuracy
+    min_dim = 1200
+    if max(image.size) < min_dim:
+        ratio = min_dim / max(image.size)
+        new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+        image = image.resize(new_size, resample=Image.LANCZOS)
 
     max_dim = 2048
     if max(image.size) > max_dim:
@@ -388,12 +375,12 @@ def preprocess_image(image, quality=None):
     else:
         image = ImageOps.autocontrast(image, cutoff=1)
 
-    # Adaptive contrast enhancement
-    contrast_factor = 2.0 if quality["contrast"] < 40 else 1.6
+    # Keep enhancement mild to avoid over-processing clean handwritten inputs.
+    contrast_factor = 1.3 if quality["contrast"] < 40 else 1.15
     image = ImageEnhance.Contrast(image).enhance(contrast_factor)
 
     # Adaptive sharpness
-    sharpness_factor = 2.5 if quality["blur"] < 100 else 1.5
+    sharpness_factor = 1.4 if quality["blur"] < 100 else 1.15
     image = ImageEnhance.Sharpness(image).enhance(sharpness_factor)
 
     return image
@@ -436,54 +423,6 @@ def ensure_correct_orientation(image):
 # 3) Post-processing
 # ---------------------------------------------------------------------------
 
-TURKISH_DICTIONARY = {
-    # Cities (81 provinces)
-    "istanbul", "ankara", "izmir", "bursa", "antalya", "adana", "konya",
-    "gaziantep", "mersin", "diyarbakir", "kayseri", "eskisehir", "trabzon",
-    "samsun", "denizli", "malatya", "erzurum", "van", "batman", "elazig",
-    "sanliurfa", "mugla", "balikesir", "manisa", "mardin", "sakarya",
-    "hatay", "kahramanmaras", "tekirdag", "aydin", "ordu", "afyonkarahisar",
-    "sivas", "tokat", "isparta", "aksaray", "giresun", "yozgat", "edirne",
-    "rize", "bolu", "kastamonu", "nigde", "usak", "kirklareli", "amasya",
-    "burdur", "karaman", "kirikkale", "corum", "duzce", "sinop", "artvin",
-    "mus", "bitlis", "siirt", "hakkari", "igdir", "kars", "ardahan",
-    "osmaniye", "kilis", "sirnak", "bartin", "karabuk", "cankiri",
-    "zonguldak", "nevsehir", "kirsehir", "bilecik", "tunceli", "gumushane",
-    "agri", "erzincan", "bingol", "yalova", "canakkale", "adiyaman",
-    "kutahya", "kirklareli", "kocaeli",
-    # Companies
-    "havelsan", "aselsan", "roketsan", "tusas", "tai", "baykar",
-    "turkcell", "vodafone", "garanti", "akbank", "yapikredi", "isbank",
-    "ziraat", "halkbank", "vakifbank", "denizbank", "finansbank",
-    # Currency & finance
-    "tl", "lira", "kurus", "dolar", "euro", "sterlin",
-    # Document terms
-    "fatura", "siparis", "toplam", "tarih", "numara", "adet", "birim",
-    "fiyat", "tutar", "miktar", "adres", "telefon", "firma", "musteri",
-    "urun", "hizmet", "kdv", "iskonto", "vade", "odeme", "banka",
-    "sozlesme", "teklif", "rapor", "belge", "dosya", "kayit", "hesap",
-    "vergi", "matrah", "kesinti", "alacak", "borc", "bakiye", "doviz",
-    "taksit", "faiz", "masraf", "komisyon", "irsaliye", "teslimat",
-    "sevkiyat", "depo", "stok", "seri", "sira", "imza", "tarih",
-    "saat", "gun", "ay", "yil", "hafta", "donem", "sure",
-    # Common verbs/words
-    "olmak", "etmek", "yapmak", "vermek", "almak", "gelmek", "gitmek",
-    "demek", "bilmek", "istemek", "bakmak", "bulmak", "durmak",
-    "odemek", "satmak", "gondermek", "teslim", "onay", "iptal",
-    "devam", "basla", "bitir", "ekle", "cikar", "degistir",
-    # Adjectives / common
-    "buyuk", "kucuk", "yeni", "eski", "iyi", "kotu", "uzun", "kisa",
-    "genis", "dar", "yuksek", "alcak", "sicak", "soguk", "acik", "kapali",
-    "genel", "ozel", "resmi", "yetkili", "sorumlu", "ilgili", "gecerli",
-    # Government / official
-    "cumhuriyet", "turkiye", "bakanlik", "mudurluk", "baskanlik",
-    "belediye", "valilik", "kaymakamlik", "noter", "mahkeme",
-    "savcilık", "emniyet", "jandarma", "nufus", "tapu", "kadastro",
-    # Connectors
-    "ve", "ile", "icin", "veya", "ama", "fakat", "ancak", "hem",
-    "bir", "bu", "su", "her", "tum", "bazi", "diger", "ayni",
-}
-
 
 def structural_corrections(text):
     """Fix structural OCR patterns common in Turkish documents."""
@@ -501,141 +440,13 @@ def structural_corrections(text):
     return text
 
 
-def spell_check_hunspell(text):
-    """Apply Hunspell-based spelling correction for Turkish text."""
-    h = load_hunspell()
-    if h is None:
-        return text
 
-    lines = text.split("\n")
-    corrected_lines = []
-
-    for line in lines:
-        words = line.split()
-        corrected = []
-        for word in words:
-            clean = word.strip(".,;:!?()\"'")
-            if not clean or len(clean) < 3:
-                corrected.append(word)
-                continue
-            if re.match(r'^[\d.,:%/\\-]+$', clean):
-                corrected.append(word)
-                continue
-            try:
-                if h.spell(clean):
-                    corrected.append(word)
-                else:
-                    suggestions = h.suggest(clean)
-                    if suggestions:
-                        best = suggestions[0]
-                        if levenshtein_distance(clean.lower(), best.lower()) <= 2:
-                            prefix = word[:word.index(clean)] if clean in word else ""
-                            suffix = word[word.index(clean) + len(clean):] if clean in word else ""
-                            corrected.append(prefix + best + suffix)
-                        else:
-                            corrected.append(word)
-                    else:
-                        corrected.append(word)
-            except Exception:
-                corrected.append(word)
-        corrected_lines.append(" ".join(corrected))
-
-    return "\n".join(corrected_lines)
-
-
-def post_process_text(text, min_confidence=0.15):
-    """
-    Enhanced post-processing pipeline:
-    1. Structural corrections (regex patterns)
-    2. Fuzzy dictionary matching
-    3. Hunspell NLP spell check
-    """
+def post_process_text(text):
+    """Post-processing pipeline: structural regex corrections only."""
     if not text:
         return text
 
-    text = structural_corrections(text)
-
-    lines = text.split("\n")
-    corrected_lines = []
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-
-        words = line.split()
-        corrected_words = []
-
-        for word in words:
-            corrected = fuzzy_match_word(word.lower(), TURKISH_DICTIONARY)
-            if corrected:
-                if word[0].isupper():
-                    corrected = corrected.capitalize()
-                elif word.isupper():
-                    corrected = corrected.upper()
-                corrected_words.append(corrected)
-            else:
-                corrected_words.append(word)
-
-        corrected_lines.append(" ".join(corrected_words))
-
-    text = "\n".join(corrected_lines)
-
-    text = spell_check_hunspell(text)
-
-    return text
-
-
-def fuzzy_match_word(word, dictionary, max_distance=2):
-    """
-    Find the closest match in dictionary using edit distance.
-    Only corrects if distance is small enough (likely OCR error).
-    """
-    if not word or len(word) < 3:
-        return None
-
-    clean = word.strip(".,;:!?()[]{}\"'")
-    if clean.lower() in dictionary:
-        return None  # Already correct
-
-    if re.match(r'^[\d.,:%/\\-]+$', clean):
-        return None
-
-    best_match = None
-    best_dist = max_distance + 1
-
-    for dict_word in dictionary:
-        if abs(len(clean) - len(dict_word)) > max_distance:
-            continue
-
-        dist = levenshtein_distance(clean.lower(), dict_word)
-        if dist <= max_distance and dist < best_dist:
-            best_dist = dist
-            best_match = dict_word
-
-    return best_match
-
-
-def levenshtein_distance(s1, s2):
-    """Compute the Levenshtein (edit) distance between two strings."""
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-
-    if len(s2) == 0:
-        return len(s1)
-
-    prev_row = range(len(s2) + 1)
-
-    for i, c1 in enumerate(s1):
-        curr_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = prev_row[j + 1] + 1
-            deletions = curr_row[j] + 1
-            substitutions = prev_row[j] + (c1 != c2)
-            curr_row.append(min(insertions, deletions, substitutions))
-        prev_row = curr_row
-
-    return prev_row[-1]
+    return structural_corrections(text)
 
 
 # Engine-specific confidence thresholds
@@ -712,7 +523,8 @@ def segment_text_lines(image):
     binary = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
     h_proj = np.sum(binary, axis=1)
-    threshold = h_proj.max() * 0.05 if h_proj.max() > 0 else 0
+    # Use a slightly stricter projection threshold to reduce noisy micro-lines.
+    threshold = h_proj.max() * 0.08 if h_proj.max() > 0 else 0
 
     in_line = False
     lines = []
@@ -724,14 +536,53 @@ def segment_text_lines(image):
             start = i
         elif in_line and val <= threshold:
             in_line = False
-            padding = 5
+            # Add a bit more margin to avoid cutting ascenders/descenders.
+            padding = 10
             lines.append((max(0, start - padding), min(len(h_proj), i + padding)))
 
     if in_line:
-        lines.append((max(0, start - 5), len(h_proj)))
+        lines.append((max(0, start - 10), len(h_proj)))
 
-    min_height = 10
+    # Filter out tiny fragments that usually come from noise after preprocessing.
+    min_height = 12
     lines = [(y1, y2) for y1, y2 in lines if (y2 - y1) >= min_height]
+
+    # Remove non-text horizontal strokes (e.g. underlines) and tiny noisy bands.
+    filtered = []
+    img_w = img_array.shape[1]
+    for y1, y2 in lines:
+        band = binary[y1:y2, :]
+        band_h = max(1, y2 - y1)
+        ink_pixels = int(np.count_nonzero(band))
+        ink_ratio = ink_pixels / float(band.size)
+        row_ink = np.sum(band > 0, axis=1)
+        active_rows = int(np.count_nonzero(row_ink > (0.05 * img_w)))
+        max_row_ink = int(row_ink.max()) if row_ink.size else 0
+
+        # Likely an underline: very long stroke concentrated in very few rows.
+        if max_row_ink > 0.70 * img_w and active_rows <= max(3, int(0.20 * band_h)):
+            continue
+        # Very light short bands are usually noise.
+        if band_h < 20 and ink_ratio < 0.01:
+            continue
+
+        filtered.append((y1, y2))
+
+    lines = filtered
+
+    # Merge adjacent fragments when a tiny gap splits the same text line.
+    if lines:
+        merged = [lines[0]]
+        for y1, y2 in lines[1:]:
+            py1, py2 = merged[-1]
+            gap = y1 - py2
+            prev_h = py2 - py1
+            curr_h = y2 - y1
+            if gap <= 2 or (gap <= 6 and (prev_h < 22 or curr_h < 22)):
+                merged[-1] = (py1, y2)
+            else:
+                merged.append((y1, y2))
+        lines = merged
 
     if not lines:
         lines = [(0, img_array.shape[0])]
@@ -870,31 +721,99 @@ def get_center_y(det):
     return sum(p[1] for p in det["bbox"]) / len(det["bbox"])
 
 
+def detect_line_regions_with_paddle(image):
+    """
+    Detect text boxes with PaddleOCR det and aggregate into line regions.
+    Returns line regions as (x1, y1, x2, y2), top-to-bottom.
+    """
+    import numpy as np
+
+    engine = load_paddleocr()
+    img_array = np.array(image)
+    img_h, img_w = img_array.shape[:2]
+    boxes = []
+
+    try:
+        result = engine.ocr(img_array, rec=False, cls=False)
+        if result and result[0]:
+            for polygon in result[0]:
+                xs = [int(p[0]) for p in polygon]
+                ys = [int(p[1]) for p in polygon]
+                x1 = max(0, min(xs))
+                x2 = min(img_w - 1, max(xs))
+                y1 = max(0, min(ys))
+                y2 = min(img_h - 1, max(ys))
+                if x2 > x1 and y2 > y1:
+                    boxes.append((x1, y1, x2, y2))
+    except Exception as e:
+        print(f"[PythonOCR] Paddle det failed: {e}", file=sys.stderr, flush=True)
+        boxes = []
+
+    if not boxes:
+        return [(0, 0, img_w - 1, img_h - 1)]
+
+    boxes.sort(key=lambda b: ((b[1] + b[3]) / 2.0, b[0]))
+    heights = [max(1, b[3] - b[1]) for b in boxes]
+    median_h = float(np.median(heights)) if heights else 20.0
+    line_threshold = max(8.0, median_h * 0.6)
+
+    lines = []
+    current = [boxes[0]]
+    current_cy = (boxes[0][1] + boxes[0][3]) / 2.0
+
+    for b in boxes[1:]:
+        cy = (b[1] + b[3]) / 2.0
+        if abs(cy - current_cy) <= line_threshold:
+            current.append(b)
+            current_cy = sum((x[1] + x[3]) / 2.0 for x in current) / len(current)
+        else:
+            lines.append(current)
+            current = [b]
+            current_cy = cy
+    if current:
+        lines.append(current)
+
+    regions = []
+    for line_boxes in lines:
+        x1 = min(b[0] for b in line_boxes)
+        y1 = min(b[1] for b in line_boxes)
+        x2 = max(b[2] for b in line_boxes)
+        y2 = max(b[3] for b in line_boxes)
+
+        pad_x = 8
+        pad_y = max(8, int(0.2 * (y2 - y1 + 1)))
+        rx1 = max(0, x1 - pad_x)
+        ry1 = max(0, y1 - pad_y)
+        rx2 = min(img_w - 1, x2 + pad_x)
+        ry2 = min(img_h - 1, y2 + pad_y)
+
+        region_h = ry2 - ry1
+        region_w = rx2 - rx1
+        if region_h < 10:
+            continue
+        if region_w > 0.75 * img_w and region_h < max(18, int(0.03 * img_h)):
+            continue
+        regions.append((rx1, ry1, rx2, ry2))
+
+    if not regions:
+        return [(0, 0, img_w - 1, img_h - 1)]
+    return regions
+
+
 def recognize_trocr(image_bytes):
-    """TrOCR with line segmentation for multi-line document support."""
+    """PaddleOCR text detection + TrOCR recognition for multi-line images."""
     import torch
     from PIL import Image
 
-    image = Image.open(io.BytesIO(image_bytes))
-
-    doc_image, detected = detect_document_region(image)
-    quality = analyze_image_quality(doc_image)
-    doc_image = deskew_image(doc_image)
-    doc_image = preprocess_image(doc_image, quality=quality)
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     processor, model = load_trocr()
-
-    line_regions = segment_text_lines(doc_image)
+    line_regions = detect_line_regions_with_paddle(image)
 
     all_texts = []
     all_confidences = []
-
-    for y_start, y_end in line_regions:
-        line_img = doc_image.crop((0, y_start, doc_image.width, y_end))
-
-        if line_img.mode != "RGB":
-            line_img = line_img.convert("RGB")
-
+    for x1, y1, x2, y2 in line_regions:
+        line_img = image.crop((x1, y1, x2, y2))
         pixel_values = processor(images=line_img, return_tensors="pt").pixel_values
 
         with torch.no_grad():
@@ -908,27 +827,23 @@ def recognize_trocr(image_bytes):
             )
 
         text = processor.batch_decode(outputs.sequences, skip_special_tokens=True)[0].strip()
-
-        confidence = 0.0
-        if hasattr(outputs, "sequences_scores") and outputs.sequences_scores is not None:
-            confidence = min(1.0, max(0.0, math.exp(outputs.sequences_scores[0].item())))
-
         if text:
             all_texts.append(text)
-            all_confidences.append(confidence)
+        conf = 0.0
+        if hasattr(outputs, "sequences_scores") and outputs.sequences_scores is not None:
+            conf = min(1.0, max(0.0, math.exp(outputs.sequences_scores[0].item())))
+        all_confidences.append(conf)
 
     full_text = "\n".join(all_texts)
-    avg_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
-
-    corrected_text = post_process_text(full_text)
+    confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.0
 
     return {
         "success": True,
-        "text": corrected_text,
+        "text": full_text,
         "raw_text": full_text,
-        "confidence": round(avg_confidence, 4),
+        "confidence": round(confidence, 4),
         "lines": len(all_texts),
-        "document_detected": detected,
+        "document_detected": False,
         "engine": "trocr",
     }
 
@@ -1258,7 +1173,13 @@ def recognize_image(image_bytes, engine="tesseract"):
     print(f"[PythonOCR] recognize_image called: engine={engine}, size={len(image_bytes)} bytes",
           file=sys.stderr, flush=True)
 
-    timeout = 300 if engine == "ensemble" else 180
+    # TrOCR can be slow on CPU with line-by-line generation.
+    if engine == "ensemble":
+        timeout = 300
+    elif engine == "trocr":
+        timeout = 420
+    else:
+        timeout = 180
 
     ctx = multiprocessing.get_context("fork")
     result_queue = ctx.Queue()
@@ -1335,8 +1256,6 @@ def run_server(port=5555):
           file=sys.stderr, flush=True)
 
     warmup_ocr(engine="tesseract")
-
-    load_hunspell()
 
     class OCRHandler(BaseHTTPRequestHandler):
         timeout = 300

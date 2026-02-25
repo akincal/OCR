@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/ocr-server .
 # Stage 2: Runtime stage with Python
 FROM python:3.10-slim-bookworm
 
-# Install Tesseract OCR, Hunspell Turkish, and runtime dependencies
+# Install Tesseract OCR and runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -36,9 +36,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-eng \
     tesseract-ocr-osd \
     libtesseract-dev \
-    hunspell \
-    hunspell-tr \
-    libhunspell-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CPU-compatible Python packages (core)
@@ -49,9 +46,9 @@ RUN pip install --no-cache-dir \
     numpy==1.24.3 \
     opencv-python-headless==4.8.1.78
 
-# PyTorch 1.13.1+cpu — last version without AVX2 requirement
+# PyTorch CPU — compatible with transformers 5.x
 RUN pip install --no-cache-dir \
-    torch==1.13.1+cpu torchvision==0.14.1+cpu \
+    torch==2.4.0+cpu torchvision==0.19.0+cpu \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 # EasyOCR without its torch/torchvision deps (already installed above)
@@ -59,7 +56,8 @@ RUN pip install --no-cache-dir --no-deps easyocr
 
 # Transformers for TrOCR + EasyOCR transitive deps
 RUN pip install --no-cache-dir \
-    transformers==4.30.2 \
+    "transformers>=5.0.0" \
+    "tokenizers>=0.20.0" \
     scikit-image \
     scipy \
     pyclipper \
@@ -67,11 +65,10 @@ RUN pip install --no-cache-dir \
     python-bidi \
     PyYAML
 
-# PaddleOCR engine + Hunspell Python bindings
+# PaddleOCR engine doc
 RUN pip install --no-cache-dir \
-    paddlepaddle==2.5.2 \
-    paddleocr==2.7.3 \
-    pyhunspell
+    paddlepaddle==2.6.2 \
+    paddleocr==2.7.3
 
 WORKDIR /app
 
