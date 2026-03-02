@@ -31,16 +31,16 @@ func main() {
 
 	ocrEngine := ocr.NewTrOCREngine(pythonPath, scriptPath)
 
-	// Start OCR engine (downloads model on first run)
-	log.Println("Starting Python OCR server (model will be downloaded on first run)...")
-	log.Println("This may take a few minutes on first launch...")
+	// Start OCR engine; Paddle (det) + TrOCR (fine-tuned) are loaded at startup (eager load)
+	log.Println("Starting Python OCR server (Paddle det + TrOCR loaded at startup)...")
+	log.Println("This may take a few minutes while models load...")
 	if err := ocrEngine.Initialize(); err != nil {
 		log.Printf("WARNING: OCR engine failed to start: %v", err)
 		log.Println("The engine will auto-restart when the first OCR request arrives.")
 		log.Println("Make sure Python dependencies are installed:")
-		log.Println("  pip3 install torch transformers easyocr Pillow opencv-python-headless numpy")
+		log.Println("  pip3 install torch transformers easyocr Pillow opencv-python-headless numpy paddlepaddle paddleocr")
 	} else {
-		log.Println("TrOCR engine initialized successfully")
+		log.Println("OCR engine initialized (Paddle det + TrOCR ready at startup)")
 	}
 
 	// Graceful shutdown

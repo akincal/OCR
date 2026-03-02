@@ -34,6 +34,8 @@ _easyocr_reader = None
 _trocr_processor = None
 _trocr_model = None
 _paddleocr_engine = None
+# Paddle detection-only engine for TrOCR pipeline (no cls/rec models loaded)
+_paddle_det_only_engine = None
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +88,11 @@ def load_trocr():
     print(f"[PythonOCR] Loading TrOCR model: {model_name}", file=sys.stderr, flush=True)
 
     _trocr_processor = TrOCRProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-    _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name, cache_dir=cache_dir)
+    # use_safetensors=True avoids torch.load vulnerability (CVE-2025-32434)
+    # which blocks loading with torch < 2.6 even when weights_only=True.
+    _trocr_model = VisionEncoderDecoderModel.from_pretrained(
+        model_name, cache_dir=cache_dir, use_safetensors=True
+    )
     _trocr_model.eval()
     return _trocr_processor, _trocr_model
 
@@ -98,21 +104,79 @@ def load_paddleocr():
 
     from paddleocr import PaddleOCR
 
-    cache_dir = os.path.join(
+    models_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
     )
 
-    _paddleocr_engine = PaddleOCR(
+    # Fine-tuned Turkish recognition model takes priority when present.
+    # Place the exported model in models/tr_PP-OCRv4_rec_infer/ and the
+    # character dictionary in models/tr_ppocr_dict.txt after Colab training.
+    custom_rec_dir  = os.path.join(models_dir, "tr_PP-OCRv4_rec_infer")
+    custom_dict     = os.path.join(models_dir, "tr_ppocr_dict.txt")
+    use_custom_model = (
+        os.path.isdir(custom_rec_dir)
+        and os.path.isfile(custom_dict)
+    )
+
+    kwargs = dict(
         use_angle_cls=True,
-        lang="tr",
         use_gpu=False,
         show_log=False,
-        det_db_thresh=0.3,
-        det_db_box_thresh=0.5,
+        det_db_thresh=0.2,
+        det_db_box_thresh=0.4,
+        det_db_unclip_ratio=2.0,
         rec_batch_num=6,
     )
+
+    if use_custom_model:
+        # Fine-tuned Turkish model: supply rec model + dict directly.
+        # Detection still uses the default PP-OCRv4 en detector.
+        print("[PythonOCR] Loading fine-tuned Turkish PP-OCRv4 rec model", file=sys.stderr, flush=True)
+        kwargs["rec_model_dir"]       = custom_rec_dir
+        kwargs["rec_char_dict_path"]  = custom_dict
+        kwargs["lang"]                = "en"           # keeps en detector (PP-OCRv4)
+        kwargs["ocr_version"]         = "PP-OCRv4"
+    else:
+        # Fallback: standard PP-OCRv4 English model.
+        # "en" alphabet covers Turkish (same Latin base) better than "tr" (PP-OCRv3).
+        kwargs["lang"]       = "en"
+        kwargs["ocr_version"] = "PP-OCRv4"
+
+    _paddleocr_engine = PaddleOCR(**kwargs)
     return _paddleocr_engine
 
+
+def load_paddle_det_only():
+    """
+    Load PaddleOCR with detection only (no angle cls, no recognition).
+    Used by TrOCR pipeline for text region detection; text extraction is done by TrOCR.
+    Avoids loading ch_ppocr_mobile_v2.0_cls_infer and rec models.
+    """
+    global _paddle_det_only_engine
+    if _paddle_det_only_engine is not None:
+        return _paddle_det_only_engine
+
+    from paddleocr import PaddleOCR
+
+    models_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
+    )
+
+    # Detection-only: same det params as full engine, no cls (no missing .tar), no rec needed.
+    kwargs = dict(
+        use_angle_cls=False,
+        use_gpu=False,
+        show_log=False,
+        det_db_thresh=0.2,
+        det_db_box_thresh=0.4,
+        det_db_unclip_ratio=2.0,
+        lang="en",
+        ocr_version="PP-OCRv4",
+    )
+
+    print("[PythonOCR] Loading PaddleOCR (detection only) for TrOCR pipeline", file=sys.stderr, flush=True)
+    _paddle_det_only_engine = PaddleOCR(**kwargs)
+    return _paddle_det_only_engine
 
 
 # ---------------------------------------------------------------------------
@@ -723,33 +787,47 @@ def get_center_y(det):
 
 def detect_line_regions_with_paddle(image):
     """
-    Detect text boxes with PaddleOCR det and aggregate into line regions.
+    Detect text boxes with PaddleOCR detector only (no cls/rec).
     Returns line regions as (x1, y1, x2, y2), top-to-bottom.
+    Used by TrOCR pipeline; recognition is done by TrOCR.
     """
     import numpy as np
 
-    engine = load_paddleocr()
+    engine = load_paddle_det_only()
     img_array = np.array(image)
     img_h, img_w = img_array.shape[:2]
     boxes = []
 
     try:
-        result = engine.ocr(img_array, rec=False, cls=False)
-        if result and result[0]:
-            for polygon in result[0]:
-                xs = [int(p[0]) for p in polygon]
-                ys = [int(p[1]) for p in polygon]
-                x1 = max(0, min(xs))
-                x2 = min(img_w - 1, max(xs))
-                y1 = max(0, min(ys))
-                y2 = min(img_h - 1, max(ys))
-                if x2 > x1 and y2 > y1:
-                    boxes.append((x1, y1, x2, y2))
+        # Use low-level detector directly because some PaddleOCR versions
+        # can fail on `ocr(..., rec=False)` with numpy truth-value errors.
+        dt_boxes, _ = engine.text_detector(img_array)
+        if dt_boxes is None:
+            dt_boxes = []
+
+        for polygon in dt_boxes:
+            xs = [int(p[0]) for p in polygon]
+            ys = [int(p[1]) for p in polygon]
+            x1 = max(0, min(xs))
+            x2 = min(img_w - 1, max(xs))
+            y1 = max(0, min(ys))
+            y2 = min(img_h - 1, max(ys))
+            if x2 > x1 and y2 > y1:
+                boxes.append((x1, y1, x2, y2))
     except Exception as e:
         print(f"[PythonOCR] Paddle det failed: {e}", file=sys.stderr, flush=True)
         boxes = []
 
     if not boxes:
+        # Fallback: horizontal projection line segmentation so TrOCR still gets per-line crops
+        try:
+            line_bands = segment_text_lines(image)
+            regions = [(0, y1, img_w - 1, y2) for y1, y2 in line_bands]
+            if regions:
+                print("[PythonOCR] Using projection-based line regions (Paddle det had no boxes)", file=sys.stderr, flush=True)
+                return regions
+        except Exception:
+            pass
         return [(0, 0, img_w - 1, img_h - 1)]
 
     boxes.sort(key=lambda b: ((b[1] + b[3]) / 2.0, b[0]))
@@ -800,6 +878,35 @@ def detect_line_regions_with_paddle(image):
     return regions
 
 
+def _prepare_crop_for_trocr(crop):
+    """
+    Prepare a line crop for TrOCR:
+    1. Upscale if height < 100px so thin strokes are readable.
+    2. Pad to square with white background so the processor doesn't
+       stretch the aspect ratio when resizing to 384x384.
+    """
+    from PIL import Image
+
+    w, h = crop.size
+
+    # Step 1: upscale short crops
+    min_h = 100
+    if h < min_h:
+        scale = min_h / h
+        new_w = max(1, int(w * scale))
+        crop = crop.resize((new_w, min_h), Image.LANCZOS)
+        w, h = crop.size
+
+    # Step 2: pad to square with white background
+    side = max(w, h)
+    padded = Image.new("RGB", (side, side), (255, 255, 255))
+    pad_x = (side - w) // 2
+    pad_y = (side - h) // 2
+    padded.paste(crop, (pad_x, pad_y))
+
+    return padded
+
+
 def recognize_trocr(image_bytes):
     """PaddleOCR text detection + TrOCR recognition for multi-line images."""
     import torch
@@ -813,7 +920,7 @@ def recognize_trocr(image_bytes):
     all_texts = []
     all_confidences = []
     for x1, y1, x2, y2 in line_regions:
-        line_img = image.crop((x1, y1, x2, y2))
+        line_img = _prepare_crop_for_trocr(image.crop((x1, y1, x2, y2)))
         pixel_values = processor(images=line_img, return_tensors="pt").pixel_values
 
         with torch.no_grad():
@@ -1241,6 +1348,44 @@ def warmup_ocr(engine="tesseract"):
         print("[PythonOCR] OCR requests may crash. Check CPU compatibility.", file=sys.stderr, flush=True)
 
 
+def preload_trocr_and_paddle_det():
+    """
+    Load Paddle (detection-only) and TrOCR at startup so the service is ready
+    with fine-tuned weights before accepting requests (no lazy loading for this pipeline).
+    Forked OCR workers inherit these loaded models from the server process.
+    """
+    from PIL import Image
+
+    model_name = os.getenv("TROCR_MODEL_NAME", "microsoft/trocr-base-handwritten")
+    print(f"[PythonOCR] Preloading Paddle (det) + TrOCR at startup (TrOCR: {model_name})...",
+          file=sys.stderr, flush=True)
+
+    try:
+        load_trocr()
+        print("[PythonOCR] TrOCR model loaded.", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[PythonOCR] WARNING: TrOCR preload failed: {e}", file=sys.stderr, flush=True)
+        raise
+
+    try:
+        load_paddle_det_only()
+        print("[PythonOCR] PaddleOCR (detection only) loaded.", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[PythonOCR] WARNING: Paddle det preload failed: {e}", file=sys.stderr, flush=True)
+        raise
+
+    # Sanity check: run one minimal inference so first request does not pay cold cost
+    try:
+        small = Image.new("RGB", (200, 60), color=(255, 255, 255))
+        buf = io.BytesIO()
+        small.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+        _ = recognize_trocr(image_bytes)
+        print("[PythonOCR] Paddle+TrOCR pipeline warm-up inference OK.", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[PythonOCR] WARNING: Paddle+TrOCR warm-up inference failed: {e}", file=sys.stderr, flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
@@ -1256,6 +1401,17 @@ def run_server(port=5555):
           file=sys.stderr, flush=True)
 
     warmup_ocr(engine="tesseract")
+
+    # Embed Paddle (det) + TrOCR at startup so service is ready with fine-tuned model
+    print("[PythonOCR] Loading Paddle (det) + TrOCR at startup (eager load)...", file=sys.stderr, flush=True)
+    try:
+        preload_trocr_and_paddle_det()
+        print("[PythonOCR] Paddle + TrOCR ready at startup.", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[PythonOCR] Startup preload failed: {e}. TrOCR requests may fail or be slow on first use.",
+              file=sys.stderr, flush=True)
+
+    class OCRHandler(BaseHTTPRequestHandler):
 
     class OCRHandler(BaseHTTPRequestHandler):
         timeout = 300
