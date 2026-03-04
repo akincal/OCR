@@ -9,59 +9,60 @@
 
 ---
 
-### Stage 1 – Builder (`golang:1.21-alpine`)
+### Stage 1 – Builder (`golang:1.21-bookworm`)
 
 | Satır / Bölüm | Açıklama |
 |---------------|----------|
-| `FROM golang:1.21-alpine` | Go 1.21 ile Alpine Linux; derleme ortamı. |
-| `apk add git build-base pkgconfig opencv-dev cmake` | CGO ile derleme ve OpenCV bağlantısı için gerekli paketler. Proje şu an CGO kullanmıyor (sadece `exec` ile Python çağrılıyor), bu paketler eski/alternatif bir mimari için. |
+| `FROM golang:1.21-bookworm` | Go 1.21 ile Debian Bookworm tabanlı resmi imaj; derleme ortamı. |
+| `apt-get install -y git build-essential pkg-config` | Go derlemesi için temel build araçları. CGO kullanılmadığı için ekstra OpenCV/ONNX paketleri yok. |
 | `WORKDIR /app` | Çalışma dizini. |
-| `COPY go.mod go.sum` | Bağımlılıkları indirmek için önce mod dosyaları kopyalanır (katman önbelleği). |
+| `COPY go.mod go.sum ./` | Bağımlılıkları indirmek için önce mod dosyaları kopyalanır (katman önbelleği). |
 | `go mod download` | Go modülleri indirilir. |
 | `COPY . .` | Tüm proje kopyalanır (kaynak + `scripts/`). |
-| `CGO_ENABLED=1 ... go build ... -o /app/ocr-server ./cmd/server` | `ocr-server` binarı üretilir. CGO=1 OpenCV/ONNX için; mevcut kodda Go tarafında CGO kullanılmıyor. |
+| `CGO_ENABLED=0 GOOS=linux go build -o /app/ocr-server ./cmd/server` | Statik Go binarı üretilir; CGO devre dışı, OpenCV/ONNX bağımlılığı yok. |
 
 ---
 
-### Stage 2 – Runtime (`alpine:latest`)
+### Stage 2 – Runtime (`python:3.10-slim-bookworm`)
 
 | Satır / Bölüm | Açıklama |
 |---------------|----------|
-| `FROM alpine:latest` | Küçük son imaj. |
-| `apk add opencv libstdc++ ca-certificates wget` | OpenCV runtime, standart C++ kütüphanesi, sertifikalar, wget (healthcheck için). |
-| **ONNX Runtime kurulumu** | `wget` ile ONNX Runtime 1.16.3 indirilir, `/usr/local/lib` ve `include` dizinlerine kopyalanır, `ldconfig` çalıştırılır. |
+| `FROM python:3.10-slim-bookworm` | Hafif Python 3.10 tabanlı imaj; Tesseract/EasyOCR/TrOCR için Python runtime. |
+| `apt-get install -y ... tesseract-ocr tesseract-ocr-tur tesseract-ocr-eng` | Tesseract motoru ve Türkçe/İngilizce dil paketleri ile gerekli sistem kütüphaneleri kurulur. |
+| `pip install pytesseract Pillow numpy opencv-python-headless ...` | Python tarafındaki OCR ve görüntü işleme bağımlılıkları (Tesseract + EasyOCR + TrOCR) kurulur. |
 | `WORKDIR /app` | Uygulama dizini. |
-| `COPY --from=builder /app/ocr-server .` | **Sadece** Go binarı kopyalanır. `scripts/`, `models/`, vb. kopyalanmıyor. |
-| `mkdir -p /app/models` | Model dizini oluşturulur. |
-| `ENV PORT=8080 MODEL_PATH=... GIN_MODE=release LD_LIBRARY_PATH=...` | Varsayılan port 8080, model yolu, Gin release modu, ONNX kütüphane yolu. |
+| `COPY --from=builder /app/ocr-server .` | Go ile derlenmiş `ocr-server` binarı kopyalanır. |
+| `COPY scripts/ ./scripts/` | Python OCR sunucusu (`scripts/ocr_inference.py`) imaja dahil edilir. |
+| `mkdir -p /app/models /app/uploads` | Model ve upload dizinleri oluşturulur. |
+| `ENV PORT=8080 MODEL_PATH=/app/models GIN_MODE=release ...` | Varsayılan port, model yolu ve performans ayarları environment değişkenleri ile set edilir. |
 | `EXPOSE 8080` | Port 8080 dışarı açılır. |
 | `HEALTHCHECK` | 30 saniyede bir `http://localhost:8080/health` kontrol edilir. |
-| `CMD ["./ocr-server"]` | Sadece `./ocr-server` çalıştırılır. |
+| `CMD ["./ocr-server"]` | Go API sunucusu başlatılır; uygulama Python OCR sunucusuna HTTP üzerinden bağlanır. |
 
 ---
 
-### Önemli uyumsuzluk (mevcut kodla)
+### Kod ile uyumluluk
 
 Bu projede OCR işi **Go binarı değil**, **Python script** (`scripts/ocr_inference.py`) tarafından yapılıyor:
 
 - Go sunucu başlarken `python3 scripts/ocr_inference.py --server --port 5555` çalıştırıyor.
-- Python tarafında EasyOCR / TrOCR (PyTorch, transformers) kullanılıyor; ONNX kullanılmıyor.
+- Python tarafında Tesseract + EasyOCR / TrOCR (PyTorch, transformers) kullanılıyor; ONNX artık kullanılmıyor.
 
-Mevcut Dockerfile’da ise:
+**Güncel Dockerfile** tam olarak bu mimariye göre güncellendi:
 
-1. **Python yok** – Alpine imajında `python3` yüklü değil.
-2. **`scripts/` kopyalanmıyor** – Runtime stage’de sadece `ocr-server` var; `ocr_inference.py` container içinde yok.
-3. **ONNX kullanılmıyor** – Uygulama Python/EasyOCR/TrOCR kullandığı için ONNX kurulumu bu mimari için gereksiz.
+1. **Python var** – Runtime imajı `python:3.10-slim-bookworm` tabanlı ve `python3` ile tüm gerekli Python paketlerini içeriyor.
+2. **`scripts/` kopyalanıyor** – Runtime stage’de `scripts/ocr_inference.py` imaja kopyalanıyor ve Go tarafı bu scripti başlatıyor.
+3. **ONNX yok** – Uygulama Python/Tesseract/EasyOCR/TrOCR kullandığı için ONNX Runtime kurulumu kaldırıldı; imaj daha sade ve küçük.
 
-Sonuç: Bu Dockerfile ile üretilen imajı çalıştırınca `python3` veya script bulunamadığı için OCR API düzgün çalışmaz. Ubuntu’ya deploy için ya bu Dockerfile’ı “Python + script” içerecek şekilde değiştirmeniz ya da Docker kullanmadan doğrudan Ubuntu’da çalıştırmanız gerekir.
+Sonuç: Mevcut Dockerfile ile üretilen imaj, OCR API’nin Go + Python mimarisiyle **uyumlu** ve production’da doğrudan kullanılabilir.
 
 ---
 
 ## 2. Ubuntu Sunucuya Deploy – Yapılacaklar Listesi
 
-### Seçenek A: Docker ile (önerilen: düzeltilmiş Dockerfile)
+### Seçenek A: Docker ile (önerilen: mevcut Dockerfile)
 
-Aşağıdaki adımlar, **Python + Go** içeren ve mevcut koda uygun bir imaj ile deploy için.
+Aşağıdaki adımlar, **Go + Python** içeren ve mevcut koda uygun Docker imajı ile deploy için.
 
 #### 2.1 Sunucuda hazırlık
 
@@ -88,12 +89,12 @@ Aşağıdaki adımlar, **Python + Go** içeren ve mevcut koda uygun bir imaj ile
    - Veya proje klasörünü scp/rsync ile kopyalayın.
 
 4. **Çalışan imajı build etmek**  
-   Proje kökünde **Python + Go** içeren `Dockerfile.python` kullanın (mevcut `Dockerfile` ONNX’e göre, uygulama Python kullanıyor):
+   Proje kökünde bulunan **güncel Dockerfile** (Go + Python) ile imajı build edin:
    ```bash
    cd /path/to/OCR-main
-   docker build -f Dockerfile.python -t ocr-api:latest .
+   docker build -t ocr-api:latest .
    ```
-   İlk build (PyTorch indirmesi) 10–20 dakika sürebilir.
+   İlk build (Python/Tesseract/EasyOCR/TrOCR kurulumu) birkaç dakika sürebilir.
 
 5. **Model dizini (isteğe bağlı)**  
    İlk çalıştırmada Python modelleri indirilebilir; kalıcı olması için volume:
@@ -227,7 +228,7 @@ sudo ufw reload
 - [ ] **Docker ile:** Docker ve (isteğe bağlı) Docker Compose kuruldu
 - [ ] **Native:** Go + Python3 + venv + pip bağımlılıkları (torch, transformers, easyocr, opencv, vb.) kuruldu
 - [ ] Proje sunucuya kopyalandı
-- [ ] **Docker ile:** Düzeltilmiş Dockerfile ile imaj build edildi; `scripts/` ve Python runtime imajda
+- [ ] **Docker ile:** Mevcut Dockerfile (Go + Python) ile imaj build edildi; `scripts/` ve Python runtime imajda
 - [ ] **Native:** `go build`, venv aktif, gerekirse `download_models.sh` çalıştırıldı
 - [ ] Port (8082 veya seçtiğiniz) açıldı ve uygulama bu portta dinliyor
 - [ ] `curl http://<sunucu>:8082/health` ile sağlık kontrolü yapıldı
@@ -236,9 +237,9 @@ sudo ufw reload
 
 ---
 
-## 4. Mevcut Dockerfile ile Yapılmaması Gerekenler
+## 4. Dockerfile ile İlgili Notlar
 
-- Mevcut `Dockerfile` (ONNX + sadece Go binarı) ile production’da **doğrudan** deploy etmeyin; OCR çalışmaz.
+- Eski ONNX + sadece Go binarı içeren Dockerfile artık kullanılmıyor; repodaki **güncel** Dockerfile Go + Python mimarisiyle uyumludur ve production için kullanılabilir.
 - Portu 8082 yapmak için runtime’da `-e PORT=8082` ve `-p 8082:8082` kullanın; Dockerfile’daki `EXPOSE`/`ENV PORT` ile uyumlu olsun.
 
-Bu rehber, Dockerfile’ı detaylı incelemeniz ve Ubuntu’ya adım adım deploy etmeniz için yeterli olmalı. İsterseniz bir sonraki adımda projeye `Dockerfile.python` (Go + Python + scripts içeren çalışan örnek) ekleyebilirim.
+Bu rehber, Dockerfile’ı detaylı incelemeniz ve Ubuntu’ya adım adım deploy etmeniz için yeterli olmalı.
