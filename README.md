@@ -312,6 +312,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [Microsoft TrOCR](https://github.com/microsoft/unilm/tree/master/trocr) - Transformer-based OCR model
 - [ONNX Runtime](https://onnxruntime.ai/) - Cross-platform ML inference
 - [GoCV](https://gocv.io/) - Go bindings for OpenCV
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) - Open source OCR engine
+- [EasyOCR](https://github.com/JaidedAI/EasyOCR) - Deep learning based OCR
 - [Gin](https://gin-gonic.com/) - Web framework
 
 ## Contact
