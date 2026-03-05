@@ -1,6 +1,6 @@
 # OCR API - Handwriting Text Recognition
 
-A powerful REST API for Optical Character Recognition (OCR) specifically optimized for handwritten text extraction. Built with Go and powered by Microsoft's TrOCR (Transformer-based OCR) model running on CPU via ONNX Runtime.
+A powerful REST API for Optical Character Recognition (OCR) specifically optimized for handwritten text extraction. Built with Go and powered by a Python-based OCR engine using Tesseract and Microsoft's TrOCR (Transformer-based OCR) model running on CPU (no GPU required).
 
 ## Features
 
@@ -23,9 +23,8 @@ A powerful REST API for Optical Character Recognition (OCR) specifically optimiz
 ### Prerequisites
 
 - Go 1.21 or later
-- OpenCV 4.x
-- ONNX Runtime 1.16+
-- Python 3.8+ (for model download script)
+- Python 3.10+ (for OCR engine)
+- Tesseract OCR with Turkish + English language packs (only required when running outside Docker)
 
 ### Installation
 
@@ -246,19 +245,18 @@ This API uses **Microsoft TrOCR** (Transformer-based OCR), specifically the `tro
 - **Base Model**: microsoft/trocr-base-handwritten
 - **Architecture**: Vision Transformer (ViT) encoder + Transformer decoder
 - **Input Size**: 384x384 pixels
-- **Runtime**: ONNX Runtime (CPU optimized)
+- **Runtime**: Python (PyTorch + Transformers, CPU optimized)
 
 ### Downloading Models
 
-The models are downloaded automatically using the setup script:
+The models are downloaded automatically using the setup script (or lazily on first use by the Python OCR server):
 ```bash
 ./scripts/download_models.sh
 ```
 
 This script:
-1. Downloads the TrOCR model from Hugging Face
-2. Converts it to ONNX format for CPU inference
-3. Saves the models to the `./models` directory
+1. Downloads the TrOCR processor and model weights from Hugging Face
+2. Caches them in the `./models` directory in the format expected by the Python OCR engine
 
 Models are approximately 500MB in size.
 
@@ -287,26 +285,17 @@ Performance metrics on standard hardware (4-core CPU):
 ## Troubleshooting
 
 ### Models not loading
-Ensure model files are present:
+Ensure model files are present in the `models/` directory:
 ```bash
 ls -lh models/
-# Should show: encoder_model.onnx, decoder_model.onnx
-```
-
-### OpenCV errors
-Install OpenCV development libraries:
-```bash
-# Ubuntu/Debian
-sudo apt-get install libopencv-dev
-
-# macOS
-brew install opencv
+# Should show TrOCR model files (e.g. config.json, pytorch_model.bin, etc.)
 ```
 
 ### Go build errors
-Ensure CGO is enabled:
+Make sure you are using Go 1.21+ and that modules are downloaded:
 ```bash
-export CGO_ENABLED=1
+go version
+go mod download
 go build ./cmd/server
 ```
 
@@ -323,6 +312,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [Microsoft TrOCR](https://github.com/microsoft/unilm/tree/master/trocr) - Transformer-based OCR model
 - [ONNX Runtime](https://onnxruntime.ai/) - Cross-platform ML inference
 - [GoCV](https://gocv.io/) - Go bindings for OpenCV
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) - Open source OCR engine
+- [EasyOCR](https://github.com/JaidedAI/EasyOCR) - Deep learning based OCR
 - [Gin](https://gin-gonic.com/) - Web framework
 
 ## Contact
