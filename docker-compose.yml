@@ -15,7 +15,6 @@ services:
       - MODEL_PATH=/app/models
       - GIN_MODE=release
       - PYTHON_PATH=python3
-      - TROCR_MODEL_NAME=/app/models/trocr-turkish-hw
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
