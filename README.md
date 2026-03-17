@@ -310,9 +310,6 @@ export CGO_ENABLED=1
 go build ./cmd/server
 ```
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
@@ -325,10 +322,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [GoCV](https://gocv.io/) - Go bindings for OpenCV
 - [Gin](https://gin-gonic.com/) - Web framework
 
-## Contact
 
-For questions and support, please open an issue on GitHub.
-
----
-
-Made with ❤️ using Go and TrOCR
