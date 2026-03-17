@@ -1411,7 +1411,6 @@ def run_server(port=5555):
         print(f"[PythonOCR] Startup preload failed: {e}. TrOCR requests may fail or be slow on first use.",
               file=sys.stderr, flush=True)
 
-    class OCRHandler(BaseHTTPRequestHandler):
 
     class OCRHandler(BaseHTTPRequestHandler):
         timeout = 300
